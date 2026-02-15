@@ -1,0 +1,14 @@
+# Finance AI Project Dependencies
+
+langchain>=1.2.10
+langgraph>=1.0.8
+openai>=2.21.0
+pinecone>=8.0.1
+streamlit>=1.54.0
+sentence-transformers>=5.2.0
+pyyaml==6.0.2
+chromadb==0.5.23
+python-dotenv==1.0.1
+
+yfinance>=0.2.40
+pandas>=2.2.2

@@ -1,0 +1,21 @@
+# Finance AI Project Configuration
+
+project:
+  name: finance_ai_project
+  version: "0.1.0"
+
+llm:
+  provider: openai
+  model: gpt-4o-mini
+  temperature: 0.2
+  max_output_tokens: 800
+  request_timeout_s: 30.0
+  max_retries: 2
+  retry_backoff_base_s: 0.8
+  retry_backoff_max_s: 8.0
+
+rag:
+  top_k: 2
+
+logging:
+  level: INFO
