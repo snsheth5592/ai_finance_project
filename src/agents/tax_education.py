@@ -36,20 +36,18 @@ def _get_llm() -> LLMClient:
 def _maybe_get_retriever():
     """Best-effort RAG retriever.
 
-    Optional: if your KB/index doesn't exist yet, we still answer generally.
+    IMPORTANT: Only use the shared `default_retriever()`.
+    Legacy retrievers may call Pinecone vector-query endpoints and break integrated-embedding indexes.
     """
     try:
         from src.rag.retrieve import default_retriever  # type: ignore
 
-        return default_retriever()
-    except Exception:
-        try:
-            from src.rag.retrieve import get_retriever  # type: ignore
-
-            return get_retriever()
-        except Exception as e:
-            logger.info("Tax agent: RAG retriever unavailable: %s", e)
-            return None
+        r = default_retriever()
+        logger.info("Tax agent: using retriever=%s", type(r).__name__)
+        return r
+    except Exception as e:
+        logger.info("Tax agent: RAG retriever unavailable: %s", e)
+        return None
 
 
 def _retrieve_context(query: str, top_k: int = 5) -> Tuple[str, List[Dict[str, Any]]]:
@@ -60,8 +58,16 @@ def _retrieve_context(query: str, top_k: int = 5) -> Tuple[str, List[Dict[str, A
     try:
         chunks = retriever.retrieve(query, top_k=top_k)  # type: ignore[attr-defined]
     except Exception as e:
-        logger.warning("Tax agent: retrieval failed: %s", e)
-        return "", []
+        logger.warning("Tax agent: retrieval failed (will reset retriever once): %s", e)
+        try:
+            from src.rag.retrieve import default_retriever  # type: ignore
+
+            retriever = default_retriever()
+            logger.info("Tax agent: retriever reset to %s", type(retriever).__name__)
+            chunks = retriever.retrieve(query, top_k=top_k)  # type: ignore[attr-defined]
+        except Exception as e2:
+            logger.warning("Tax agent: retrieval retry failed: %s", e2)
+            return "", []
 
     context_parts: List[str] = []
     sources: List[Dict[str, Any]] = []

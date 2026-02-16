@@ -18,7 +18,7 @@ class RetrievedChunk:
     source: str
     title: str
     url: Optional[str] = None
-    score: Optional[float] = None  # Chroma distances/similarity depending on config
+    score: Optional[float] = None  # Pinecone distances/similarity depending on config
 
 
 class InMemoryRetriever:
@@ -343,7 +343,7 @@ def default_retriever():
       1) Pinecone (if PINECONE_API_KEY and PINECONE_INDEX_NAME are set)
       2) In-memory markdown retrieval
 
-    This avoids Chroma/SQLite issues on Streamlit Community Cloud.
+    This avoids Pinecone issues on Streamlit Community Cloud.
     """
     repo_root = Path(__file__).resolve().parents[2]
     kb_dir = repo_root / "src" / "data" / "knowledge_base"

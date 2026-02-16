@@ -42,7 +42,6 @@ _RETRIEVER = None
 _LLM = None
 
 # RAG tuning (MVP defaults)
-# NOTE: Chroma returns a distance-like score (lower is better) for the default collection.
 RAG_MAX_UNIQUE_DOCS = 3
 RAG_SCORE_THRESHOLD = 1.2
 
@@ -108,7 +107,7 @@ def retrieve_context(user_query: str, top_k: int = 5) -> List[RetrievedChunk]:
     global _RETRIEVER
     if _RETRIEVER is None:
         _RETRIEVER = default_retriever()
-        logger.info("Initialized Chroma retriever.")
+        logger.info("Initialized Pinecone retriever.")
 
     try:
         chunks = _RETRIEVER.retrieve(user_query, top_k=top_k)
