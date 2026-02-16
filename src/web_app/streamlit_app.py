@@ -14,8 +14,6 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import os
-st.write("src/data/knowledge_base:")
-st.write(os.listdir("src/data/knowledge_base"))
 
 # Load .env before other imports (OpenAI, etc. need OPENAI_API_KEY)
 from src.core.env import load_env
@@ -29,6 +27,9 @@ from streamlit_autorefresh import st_autorefresh
 from src.core.config import load_settings
 from src.utils.logging import setup_logging
 from src.workflow.router import RouterError, run as run_router, AgentName
+
+st.write("src/data/knowledge_base:")
+st.write(os.listdir("src/data/knowledge_base"))
 
 # ------------------- Lazy agent loaders (avoid import-time crashes on Streamlit Cloud) -------------------
 
