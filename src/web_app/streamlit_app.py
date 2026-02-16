@@ -28,9 +28,6 @@ from src.core.config import load_settings
 from src.utils.logging import setup_logging
 from src.workflow.router import RouterError, run as run_router, AgentName
 
-st.write("src/data/knowledge_base:")
-st.write(os.listdir("src/data/knowledge_base"))
-
 # ------------------- Lazy agent loaders (avoid import-time crashes on Streamlit Cloud) -------------------
 
 def _run_finance_qa_agent(user_query: str, rag_top_k: int) -> Dict[str, Any]:

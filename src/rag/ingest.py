@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 import chromadb
 from sentence_transformers import SentenceTransformer
@@ -70,46 +70,64 @@ def load_markdown_docs(kb_dir: Path) -> List[DocChunk]:
     return chunks
 
 
-def main() -> None:
-    repo_root = Path(__file__).resolve().parents[2]
-    kb_dir = repo_root / "src" / "data" / "knowledge_base"
-    persist_dir = repo_root / "src" / "data" / "chroma"
+def ingest_markdown_kb(
+    kb_dir: Path,
+    persist_dir: Path,
+    collection_name: str = "finance_kb",
+    model_name: str = "all-MiniLM-L6-v2",
+    rebuild: bool = False,
+) -> int:
+    """Ingest markdown KB into a persistent Chroma collection.
 
+    - rebuild=False (default): upsert/update docs without wiping the collection
+    - rebuild=True: delete and recreate the collection (useful locally)
+
+    Returns number of chunks ingested.
+    """
     kb_dir.mkdir(parents=True, exist_ok=True)
     persist_dir.mkdir(parents=True, exist_ok=True)
 
     docs = load_markdown_docs(kb_dir)
     if not docs:
-        raise RuntimeError(
-            f"No .md files found in {kb_dir}. Add at least 3-5 small finance explainers first."
-        )
+        raise RuntimeError(f"No .md files found in {kb_dir}.")
 
-    model = SentenceTransformer("all-MiniLM-L6-v2")
+    model = SentenceTransformer(model_name)
 
     client = chromadb.PersistentClient(path=str(persist_dir))
-    col = client.get_or_create_collection(name="finance_kb")
 
-    # Rebuild for MVP simplicity
-    try:
-        client.delete_collection("finance_kb")
-    except Exception:
-        pass
-    col = client.get_or_create_collection(name="finance_kb")
+    if rebuild:
+        try:
+            client.delete_collection(collection_name)
+        except Exception:
+            pass
+
+    col = client.get_or_create_collection(name=collection_name)
 
     texts = [d.text for d in docs]
     embeddings = model.encode(texts, show_progress_bar=True).tolist()
+    ids = [d.doc_id for d in docs]
+    metadatas = [{"title": d.title, "source": d.source, "url": d.url} for d in docs]
 
-    col.add(
-        ids=[d.doc_id for d in docs],
-        documents=texts,
-        embeddings=embeddings,
-        metadatas=[
-            {"title": d.title, "source": d.source, "url": d.url}
-            for d in docs
-        ],
-    )
+    # Prefer upsert if available; otherwise delete then add.
+    if hasattr(col, "upsert"):
+        col.upsert(ids=ids, documents=texts, embeddings=embeddings, metadatas=metadatas)
+    else:
+        try:
+            col.delete(ids=ids)
+        except Exception:
+            pass
+        col.add(ids=ids, documents=texts, embeddings=embeddings, metadatas=metadatas)
 
-    print(f"Ingested {len(docs)} chunks into Chroma at {persist_dir}")
+    return len(docs)
+
+
+def main() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    kb_dir = repo_root / "src" / "data" / "knowledge_base"
+    persist_dir = repo_root / "src" / "data" / "chroma"
+
+    n = ingest_markdown_kb(kb_dir=kb_dir, persist_dir=persist_dir, rebuild=True)
+    print(f"Ingested {n} chunks into Chroma at {persist_dir}")
 
 
 if __name__ == "__main__":
