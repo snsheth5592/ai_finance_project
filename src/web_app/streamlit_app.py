@@ -24,13 +24,44 @@ from streamlit_autorefresh import st_autorefresh
 
 from src.core.config import load_settings
 from src.utils.logging import setup_logging
-from src.agents.finance_qa_agent import run_finance_qa_agent
-from src.agents.portfolio_agent import run_portfolio_agent
-from src.agents.market_analysis_agent import run_market_analysis_agent
-from src.agents.goal_planning_agent import run_goal_planning_agent
-from src.agents.news_agent import run_news_agent
-from src.agents.tax_education import run_tax_education_agent
 from src.workflow.router import RouterError, run as run_router, AgentName
+
+# ------------------- Lazy agent loaders (avoid import-time crashes on Streamlit Cloud) -------------------
+
+def _run_finance_qa_agent(user_query: str, rag_top_k: int) -> Dict[str, Any]:
+    from src.agents.finance_qa_agent import run_finance_qa_agent
+
+    return run_finance_qa_agent(user_query, rag_top_k=rag_top_k)
+
+
+def _run_portfolio_agent(payload: Dict[str, Any]) -> Dict[str, Any]:
+    from src.agents.portfolio_agent import run_portfolio_agent
+
+    return run_portfolio_agent(payload)
+
+
+def _run_market_analysis_agent(user_query: str) -> Dict[str, Any]:
+    from src.agents.market_analysis_agent import run_market_analysis_agent
+
+    return run_market_analysis_agent(user_query)
+
+
+def _run_goal_planning_agent(user_query: str) -> Dict[str, Any]:
+    from src.agents.goal_planning_agent import run_goal_planning_agent
+
+    return run_goal_planning_agent(user_query)
+
+
+def _run_news_agent(user_query: str) -> Dict[str, Any]:
+    from src.agents.news_agent import run_news_agent
+
+    return run_news_agent(user_query)
+
+
+def _run_tax_education_agent(user_query: str) -> Dict[str, Any]:
+    from src.agents.tax_education import run_tax_education_agent
+
+    return run_tax_education_agent(user_query)
 
 
 def render_sources(sources: list[dict[str, str]]) -> None:
@@ -646,10 +677,7 @@ with qa_tab:
             st.markdown(user_query)
 
         try:
-            result: Dict[str, Any] = run_finance_qa_agent(
-                user_query,
-                rag_top_k=settings.rag_top_k,
-            )
+            result: Dict[str, Any] = _run_finance_qa_agent(user_query, rag_top_k=settings.rag_top_k)
         except Exception as e:
             st.error("Agent crashed while answering.")
             st.exception(e)
@@ -718,7 +746,7 @@ with portfolio_tab:
             st.stop()
 
         try:
-            result: Dict[str, Any] = run_portfolio_agent(payload)
+            result: Dict[str, Any] = _run_portfolio_agent(payload)
         except Exception as e:
             st.error("Portfolio agent crashed while analyzing.")
             st.exception(e)
@@ -752,7 +780,7 @@ with market_tab:
             st.stop()
 
         try:
-            result: Dict[str, Any] = run_market_analysis_agent(q)
+            result: Dict[str, Any] = _run_market_analysis_agent(q)
         except Exception as e:
             st.error("Market agent crashed.")
             st.exception(e)
@@ -787,7 +815,7 @@ with goal_tab:
             st.stop()
 
         try:
-            result: Dict[str, Any] = run_goal_planning_agent(q)
+            result: Dict[str, Any] = _run_goal_planning_agent(q)
         except Exception as e:
             st.error("Goal planning agent crashed.")
             st.exception(e)
@@ -822,7 +850,7 @@ with news_tab:
             st.stop()
 
         try:
-            result: Dict[str, Any] = run_news_agent(q)
+            result: Dict[str, Any] = _run_news_agent(q)
         except Exception as e:
             st.error("News agent crashed.")
             st.exception(e)
@@ -857,7 +885,7 @@ with tax_tab:
             st.stop()
 
         try:
-            result: Dict[str, Any] = run_tax_education_agent(q)
+            result: Dict[str, Any] = _run_tax_education_agent(q)
         except Exception as e:
             st.error("Tax agent crashed.")
             st.exception(e)
