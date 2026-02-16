@@ -13,6 +13,10 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+import os
+st.write("src/data/knowledge_base:")
+st.write(os.listdir("src/data/knowledge_base"))
+
 # Load .env before other imports (OpenAI, etc. need OPENAI_API_KEY)
 from src.core.env import load_env
 load_env()
