@@ -112,19 +112,37 @@ def retrieve_context(user_query: str, top_k: int = 5) -> List[RetrievedChunk]:
 
     try:
         chunks = _RETRIEVER.retrieve(user_query, top_k=top_k)
-        logger.info("Retrieved %s raw chunks for query.", len(chunks))
-
-        tuned = _filter_and_dedupe_chunks(chunks)
-        logger.info(
-            "RAG tuned chunks=%s (max_unique_docs=%s, score_threshold=%s)",
-            len(tuned),
-            RAG_MAX_UNIQUE_DOCS,
-            RAG_SCORE_THRESHOLD,
-        )
-        return tuned
     except Exception as e:
-        logger.exception("RAG retrieval failed: %s", e)
-        return []
+        # Streamlit Cloud can produce stale Chroma collection handles between reruns.
+        # If we hit that, rebuild the retriever once and retry.
+        msg = str(e).lower()
+        try:
+            from chromadb.errors import InvalidCollectionException
+        except Exception:
+            InvalidCollectionException = ()  # type: ignore
+
+        if (InvalidCollectionException and isinstance(e, InvalidCollectionException)) or "does not exist" in msg:
+            logger.warning("RAG retrieval hit stale collection; resetting retriever and retrying once")
+            try:
+                _RETRIEVER = default_retriever()
+                chunks = _RETRIEVER.retrieve(user_query, top_k=top_k)
+            except Exception as e2:
+                logger.exception("RAG retry after reset failed: %s", e2)
+                return []
+        else:
+            logger.exception("RAG retrieval failed: %s", e)
+            return []
+
+    logger.info("Retrieved %s raw chunks for query.", len(chunks))
+
+    tuned = _filter_and_dedupe_chunks(chunks)
+    logger.info(
+        "RAG tuned chunks=%s (max_unique_docs=%s, score_threshold=%s)",
+        len(tuned),
+        RAG_MAX_UNIQUE_DOCS,
+        RAG_SCORE_THRESHOLD,
+    )
+    return tuned
 
 
 def _build_sources(chunks: List[RetrievedChunk]) -> List[Dict[str, str]]:
