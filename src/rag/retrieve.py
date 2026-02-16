@@ -49,6 +49,15 @@ class ChromaRetriever:
         # Auto-ingest KB if the collection is empty (common on Streamlit Community Cloud)
         try:
             existing = self.collection.count()  # type: ignore[attr-defined]
+        except InvalidCollectionException:
+            # Stale handle: recreate collection then treat as empty
+            logger.warning("Chroma collection stale during count(); recreating handle")
+            self.client = chromadb.PersistentClient(path=str(self.persist_dir))
+            self.collection = self.client.get_or_create_collection(name=self.collection_name)
+            try:
+                existing = self.collection.count()  # type: ignore[attr-defined]
+            except Exception:
+                existing = 0
         except Exception:
             existing = 0
 
@@ -84,6 +93,7 @@ class ChromaRetriever:
                 )
 
                 # Re-open collection after ingest
+                self.persist_dir = persist_dir2
                 self.client = chromadb.PersistentClient(path=str(persist_dir2))
                 self.collection = self.client.get_or_create_collection(name=collection_name)
 
@@ -129,6 +139,14 @@ class ChromaRetriever:
         if not docs:
             try:
                 cnt = self.collection.count()  # type: ignore[attr-defined]
+            except InvalidCollectionException:
+                logger.warning("Chroma collection stale during count() in retrieve(); recreating handle")
+                self.client = chromadb.PersistentClient(path=str(self.persist_dir))
+                self.collection = self.client.get_or_create_collection(name=self.collection_name)
+                try:
+                    cnt = self.collection.count()  # type: ignore[attr-defined]
+                except Exception:
+                    cnt = 0
             except Exception:
                 cnt = 0
 
