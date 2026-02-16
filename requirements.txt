@@ -9,6 +9,6 @@ sentence-transformers>=5.2.0
 pyyaml==6.0.2
 chromadb==0.5.23
 python-dotenv==1.0.1
-
+streamlit-autorefresh>=1.0.1
 yfinance>=0.2.40
 pandas>=2.2.2

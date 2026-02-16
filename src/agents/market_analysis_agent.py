@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import re
+import os
 import time
+import json
 from dataclasses import dataclass
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
@@ -68,6 +70,13 @@ def _cache_get(key: str) -> Optional[Any]:
 
 def _cache_set(key: str, val: Any) -> None:
     _CACHE[key] = (time.time(), val)
+
+
+def _safe_float(x: Any) -> float:
+    """Convert to float, handling pandas Series (deprecated float(Series) in future)."""
+    if hasattr(x, "iloc"):
+        return float(x.iloc[0])
+    return float(x)
 
 
 def _classify_intent(user_query: str) -> Intent:
@@ -143,12 +152,174 @@ def _extract_symbol(user_query: str) -> Optional[str]:
         "AI",
         "USA",
     }
+
+    # Map common company-name tokens to tickers (MVP). This prevents treating words like APPLE as tickers.
+    token_aliases = {
+        "APPLE": "AAPL",
+        "TESLA": "TSLA",
+        "AMAZON": "AMZN",
+        "MICROSOFT": "MSFT",
+        "GOOGLE": "GOOGL",
+        "ALPHABET": "GOOGL",
+        "META": "META",
+        "FACEBOOK": "META",
+        "NVIDIA": "NVDA",
+        "NETFLIX": "NFLX",
+    }
+
     text = (user_query or "").upper()
     for m in _SYMBOL_RE.finditer(text):
         sym = m.group(0)
         if sym in deny:
             continue
+        if sym in token_aliases:
+            return token_aliases[sym]
         return sym
+    return None
+
+
+# -----------------------------
+# Symbol resolution via Tavily
+# -----------------------------
+
+_TAVILY_CACHE: Dict[str, Tuple[float, Optional[str]]] = {}
+_TAVILY_TTL_S = 24 * 60 * 60  # 24h
+
+
+def _tavily_cache_get(key: str) -> Optional[Optional[str]]:
+    item = _TAVILY_CACHE.get(key)
+    if not item:
+        return None
+    ts, val = item
+    if (time.time() - ts) > _TAVILY_TTL_S:
+        _TAVILY_CACHE.pop(key, None)
+        return None
+    return val
+
+
+def _tavily_cache_set(key: str, val: Optional[str]) -> None:
+    _TAVILY_CACHE[key] = (time.time(), val)
+
+
+def _parse_ticker_from_text(text: str) -> Optional[str]:
+    """Extract a plausible US ticker from arbitrary text."""
+    if not text:
+        return None
+
+    # Common patterns seen in search snippets
+    patterns = [
+        r"\bNASDAQ:\s*([A-Z]{1,6}(?:-[A-Z])?)\b",
+        r"\bNYSE:\s*([A-Z]{1,6}(?:-[A-Z])?)\b",
+        r"\bTicker\s*[:\-]\s*([A-Z]{1,6}(?:-[A-Z])?)\b",
+        r"\bSymbol\s*[:\-]\s*([A-Z]{1,6}(?:-[A-Z])?)\b",
+        r"\(([A-Z]{1,6}(?:-[A-Z])?)\)\s*(?:stock|shares)?\b",
+    ]
+
+    deny = {
+        "ETF",
+        "ETFS",
+        "IRA",
+        "IRAS",
+        "ROTH",
+        "FINRA",
+        "SEC",
+        "IRS",
+        "DCA",
+        "HHI",
+        "API",
+        "AI",
+        "USA",
+    }
+
+    for pat in patterns:
+        m = re.search(pat, text, flags=re.IGNORECASE)
+        if not m:
+            continue
+        sym = m.group(1).upper()
+        if sym in deny:
+            continue
+        # Basic sanity: avoid words like APPLE, TESLA if the snippet didn't specify an exchange.
+        # If the snippet explicitly has NASDAQ/NYSE, accept it.
+        return sym
+
+    return None
+
+
+def _resolve_symbol_via_tavily(user_query: str) -> Optional[str]:
+    """Use Tavily web search to resolve company-name queries to a ticker symbol.
+
+    Requires env var TAVILY_API_KEY (Bearer token).
+    Docs: https://docs.tavily.com/documentation/api-reference/endpoint/search
+    """
+    api_key = os.getenv("TAVILY_API_KEY")
+    if not api_key:
+        return None
+
+    # If user already wrote a ticker-like token, don't search.
+    existing = _extract_symbol(user_query)
+    if existing:
+        return existing
+
+    cache_key = f"tavily:ticker:{user_query.strip().lower()}"
+    cached = _tavily_cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    try:
+        import requests  # type: ignore
+    except Exception:
+        logger.warning("requests not installed; Tavily resolver disabled")
+        return None
+
+    url = "https://api.tavily.com/search"
+    query = f"{user_query} ticker symbol"
+
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+    }
+
+    payload = {
+        "query": query,
+        "search_depth": "basic",
+        "max_results": 5,
+        "include_answer": False,
+        "include_raw_content": False,
+    }
+
+    try:
+        resp = requests.post(url, headers=headers, data=json.dumps(payload), timeout=12)
+        if resp.status_code != 200:
+            logger.warning("Tavily non-200 status=%s body=%r", resp.status_code, resp.text[:500])
+            _tavily_cache_set(cache_key, None)
+            return None
+        data = resp.json()
+    except Exception as e:
+        logger.warning("Tavily request failed: %s", e)
+        _tavily_cache_set(cache_key, None)
+        return None
+
+    # Tavily response contains `results`: list of {title, url, content, ...}
+    results = data.get("results") or []
+
+    # First pass: look for explicit exchange patterns in titles/snippets
+    for r in results:
+        for field in (r.get("title"), r.get("content"), r.get("url")):
+            sym = _parse_ticker_from_text(str(field or ""))
+            if sym:
+                _tavily_cache_set(cache_key, sym)
+                logger.info("Resolved ticker via Tavily: query=%r symbol=%s", user_query, sym)
+                return sym
+
+    # Second pass: sometimes the company appears as "Apple Inc. (AAPL)" — try looser parentheses capture
+    paren = re.search(r"\(([A-Z]{1,6}(?:-[A-Z])?)\)", json.dumps(results), flags=re.IGNORECASE)
+    if paren:
+        sym = paren.group(1).upper()
+        _tavily_cache_set(cache_key, sym)
+        logger.info("Resolved ticker via Tavily (paren fallback): query=%r symbol=%s", user_query, sym)
+        return sym
+
+    _tavily_cache_set(cache_key, None)
     return None
 
 
@@ -208,11 +379,11 @@ def fetch_quote_and_daily(symbol: str) -> Tuple[Quote, List[DailyBar]]:
         )
 
     latest = df_5d.iloc[-1]
-    latest_close = float(latest.get("Close"))
+    latest_close = _safe_float(latest.get("Close"))
 
     # Day-over-day change uses previous close if available
     if len(df_5d.index) >= 2:
-        prev_close = float(df_5d.iloc[-2].get("Close"))
+        prev_close = _safe_float(df_5d.iloc[-2].get("Close"))
     else:
         prev_close = latest_close
 
@@ -246,11 +417,11 @@ def fetch_quote_and_daily(symbol: str) -> Tuple[Quote, List[DailyBar]]:
                 bars.append(
                     DailyBar(
                         date=date,
-                        open=float(row.get("Open")),
-                        high=float(row.get("High")),
-                        low=float(row.get("Low")),
-                        close=float(row.get("Close")),
-                        volume=int(float(row.get("Volume", 0) or 0)),
+                        open=_safe_float(row.get("Open")),
+                        high=_safe_float(row.get("High")),
+                        low=_safe_float(row.get("Low")),
+                        close=_safe_float(row.get("Close")),
+                        volume=int(_safe_float(row.get("Volume", 0) or 0)),
                     )
                 )
             except Exception:
@@ -316,36 +487,44 @@ def run_market_analysis_agent(user_query: str) -> Dict[str, Any]:
     intent = _classify_intent(user_query)
     logger.info("Market Analysis intent=%s query=%r", intent, user_query)
 
-    if intent == "ADVICE_REQUEST":
-        return {
-            "intent": intent,
-            "answer": (
-                "I can’t tell you what to buy or sell. I can, however, provide current market data "
-                "and explain how to interpret it (risk, diversification, time horizon)."
-            ),
-            "disclaimer": "Educational information only — not financial, tax, or legal advice.",
-            "sources": [
-                {
-                    "title": "Yahoo Finance market data (via yfinance)",
-                    "source": "Yahoo Finance",
-                    "url": "https://pypi.org/project/yfinance/",
-                }
-            ],
-        }
-
     symbol = _extract_symbol(user_query)
+    if not symbol:
+        # Fallback: try Tavily web search to resolve company name -> ticker symbol.
+        symbol = _resolve_symbol_via_tavily(user_query)
+
     if not symbol:
         return {
             "intent": intent,
             "answer": (
                 "I can provide market data, but I need a ticker symbol in your question "
-                "(e.g., AAPL, TSLA, SPY, ^GSPC)."
+                "(e.g., AAPL, TSLA, SPY, ^GSPC). "
+                "Tip: set TAVILY_API_KEY to enable automatic company-name → ticker resolution."
             ),
             "disclaimer": "Educational information only — not financial, tax, or legal advice.",
             "sources": [],
         }
 
     warnings: List[str] = []
+
+    sources = [
+        {
+            "title": "Yahoo Finance market data (via yfinance)",
+            "source": "Yahoo Finance",
+            "url": "https://pypi.org/project/yfinance/",
+        }
+    ]
+
+    # If the original query didn't include a ticker and we resolved one via Tavily, record it.
+    if _extract_symbol(user_query) is None and os.getenv("TAVILY_API_KEY"):
+        # We can't know for sure whether Tavily was used without more plumbing, but this is a reasonable hint.
+        warnings.append("Ticker symbol may have been resolved via web search (Tavily).")
+        sources.append(
+            {
+                "title": "Tavily Search API",
+                "source": "Tavily",
+                "url": "https://docs.tavily.com/documentation/api-reference/endpoint/search",
+            }
+        )
 
     try:
         quote, bars = fetch_quote_and_daily(symbol)
@@ -358,13 +537,7 @@ def run_market_analysis_agent(user_query: str) -> Dict[str, Any]:
             "symbol": symbol,
             "answer": str(e),
             "disclaimer": "Educational information only — not financial, tax, or legal advice.",
-            "sources": [
-                {
-                    "title": "Yahoo Finance market data (via yfinance)",
-                    "source": "Yahoo Finance",
-                    "url": "https://pypi.org/project/yfinance/",
-                }
-            ],
+            "sources": sources,
         }
 
     q = summary["quote"]
@@ -397,11 +570,5 @@ def run_market_analysis_agent(user_query: str) -> Dict[str, Any]:
         "market": summary,
         "warnings": warnings,
         "disclaimer": "Educational information only — not financial, tax, or legal advice.",
-        "sources": [
-            {
-                "title": "Yahoo Finance market data (via yfinance)",
-                "source": "Yahoo Finance",
-                "url": "https://pypi.org/project/yfinance/",
-            }
-        ],
+        "sources": sources,
     }

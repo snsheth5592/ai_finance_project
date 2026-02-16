@@ -16,6 +16,9 @@ class AgentName(str, Enum):
     FINANCE_QA = "finance_qa"
     PORTFOLIO = "portfolio"
     MARKET = "market"
+    GOAL_PLANNING = "goal_planning"
+    NEWS = "news"
+    TAX_EDUCATION = "tax_education"
 
 
 @dataclass(frozen=True)
@@ -80,9 +83,47 @@ def _get_router_llm() -> Optional[LLMClient]:
         return None
 
 
+def _extract_first_json_object(text: str) -> Optional[str]:
+    """Extract the first JSON object substring from a string.
+
+    Handles cases where the model wraps JSON in code fences or adds extra text.
+    """
+    if not text:
+        return None
+
+    s = text.strip()
+
+    # Strip common fenced blocks
+    if s.startswith("```"):
+        # Remove leading fence line
+        s = re.sub(r"^```[a-zA-Z0-9_-]*\n", "", s)
+        # Remove trailing fence
+        s = re.sub(r"\n```\s*$", "", s)
+        s = s.strip()
+
+    # Find first {...} region using a simple brace counter
+    start = s.find("{")
+    if start == -1:
+        return None
+
+    depth = 0
+    for i in range(start, len(s)):
+        ch = s[i]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return s[start : i + 1]
+
+    return None
+
+
 def _safe_json_loads(text: str) -> Optional[Dict[str, Any]]:
+    raw = _extract_first_json_object(text) or text
     try:
-        return json.loads(text)
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else None
     except Exception:
         return None
 
@@ -190,24 +231,190 @@ def _looks_like_market_query(text: str) -> bool:
     return any(k in q for k in keywords)
 
 
+def _looks_like_goal_planning_query(text: str) -> bool:
+    """Heuristic to decide if a query is about goal setting / planning.
+
+    We intentionally avoid routing obvious market/quote questions into goal planning.
+    """
+    q = (text or "").lower()
+
+    goal_hits = any(
+        k in q
+        for k in [
+            "goal",
+            "save",
+            "saving",
+            "budget",
+            "how much per month",
+            "monthly",
+            "timeline",
+            "down payment",
+            "emergency fund",
+            "retire",
+            "retirement",
+            "pay off",
+            "debt",
+        ]
+    )
+
+    market_exclusions = any(
+        k in q
+        for k in [
+            "price",
+            "quote",
+            "ticker",
+            "symbol",
+            "chart",
+            "performance",
+            "52 week",
+            "52-week",
+            "market cap",
+            "stock price",
+        ]
+    )
+
+    return goal_hits and not market_exclusions
+
+
+def _looks_like_news_query(text: str) -> bool:
+    """Heuristic to decide if a query is asking for financial news or headline summaries."""
+    q = (text or "").lower()
+
+    news_hits = any(
+        k in q
+        for k in [
+            "news",
+            "headlines",
+            "what happened",
+            "latest",
+            "recent",
+            "update",
+            "updates",
+            "earnings",
+            "guidance",
+            "sec filing",
+            "lawsuit",
+        ]
+    )
+
+    # If user explicitly asks for price/performance/chart, prefer market agent.
+    market_exclusions = any(
+        k in q
+        for k in [
+            "price",
+            "quote",
+            "chart",
+            "performance",
+            "52 week",
+            "52-week",
+            "market cap",
+        ]
+    )
+
+    return news_hits and not market_exclusions
+
+
+# --- TAX EDUCATION HEURISTIC ---
+def _looks_like_tax_query(text: str) -> bool:
+    """Heuristic to decide if a query is about tax concepts or account types."""
+    q = (text or "").lower()
+
+    tax_hits = any(
+        k in q
+        for k in [
+            "tax",
+            "taxes",
+            "capital gains",
+            "short term",
+            "long term",
+            "wash sale",
+            "tax loss",
+            "tax-loss",
+            "withholding",
+            "deduction",
+            "deductions",
+            "credit",
+            "credits",
+            "bracket",
+            "brackets",
+            "standard deduction",
+            "itemized",
+            "1099",
+            "w-2",
+            "w2",
+            "irs",
+            "state tax",
+            "filing",
+            "filing status",
+            "roth",
+            "traditional ira",
+            "ira",
+            "401k",
+            "401(k)",
+            "hsa",
+            "fsa",
+            "529",
+        ]
+    )
+
+    # If it's explicitly a market quote/performance question, don't send to tax.
+    market_exclusions = any(
+        k in q
+        for k in [
+            "price",
+            "quote",
+            "chart",
+            "performance",
+            "52 week",
+            "52-week",
+            "market cap",
+            "ticker",
+            "symbol",
+        ]
+    )
+
+    return tax_hits and not market_exclusions
+
+
 def _llm_route_text(user_query: str) -> Tuple[AgentName, Optional[str]]:
     """LLM router for text. Returns (agent, resolved_symbol)."""
+    # Deterministic pre-routing to reduce LLM mistakes.
+    if _looks_like_news_query(user_query):
+        # Symbol optional; news agent can operate without one.
+        return AgentName.NEWS, _extract_symbol_from_text(user_query) or _company_alias_to_ticker(user_query)
+
+    if _looks_like_tax_query(user_query):
+        return AgentName.TAX_EDUCATION, None
+
+    if _looks_like_market_query(user_query):
+        return AgentName.MARKET, _extract_symbol_from_text(user_query) or _company_alias_to_ticker(user_query)
+
+    if _looks_like_goal_planning_query(user_query):
+        return AgentName.GOAL_PLANNING, None
+
     llm = _get_router_llm()
     if llm is None:
         # Heuristic fallback
-        if _looks_like_market_query(user_query):
-            return AgentName.MARKET, _extract_symbol_from_text(user_query) or _company_alias_to_ticker(user_query)
+        if _looks_like_news_query(user_query):
+            return AgentName.NEWS, _extract_symbol_from_text(user_query) or _company_alias_to_ticker(user_query)
+        if _looks_like_tax_query(user_query):
+            return AgentName.TAX_EDUCATION, None
+        if _looks_like_goal_planning_query(user_query):
+            return AgentName.GOAL_PLANNING, None
         return AgentName.FINANCE_QA, None
 
     system = (
         "You are a strict router for an AI Finance Assistant. "
-        "Choose exactly one agent: finance_qa, market, portfolio. "
+        "Choose exactly one agent: finance_qa, market, portfolio, goal_planning, news, tax_education. "
         "- finance_qa: definitions/education (what is an ETF, diversification, taxes explained). "
         "- market: requests for price/performance/news-like market moves for a public security. "
         "- portfolio: ONLY when the user provides structured holdings/portfolio details to analyze. "
+        "- goal_planning: assists with financial goal setting and planning (saving targets, timelines, budgeting steps). "
+        "- news: summarize and contextualize financial news and headlines about a company or topic. "
+        "- tax_education: explains tax concepts and account types (Roth vs Traditional, IRA/401k, HSA/FSA, capital gains, wash sales). "
         "If the user asks about a company name (e.g., Tesla) and wants market data, output its ticker in 'symbol'. "
         "If no symbol is needed or unknown, set symbol to null. "
-        "Output ONLY valid JSON: {\"agent\": <one of finance_qa|market|portfolio>, \"symbol\": <string or null>}"
+        "Output ONLY valid JSON: {\"agent\": <one of finance_qa|market|portfolio|goal_planning|news|tax_education>, \"symbol\": <string or null>}"
     )
 
     prompt = f"User query: {user_query}"
@@ -216,15 +423,23 @@ def _llm_route_text(user_query: str) -> Tuple[AgentName, Optional[str]]:
         text = llm.generate(system_prompt=system, user_prompt=prompt)
     except Exception as e:
         logger.warning("LLM routing call failed; falling back to heuristics. err=%s", e)
-        if _looks_like_market_query(user_query):
-            return AgentName.MARKET, _extract_symbol_from_text(user_query) or _company_alias_to_ticker(user_query)
+        if _looks_like_news_query(user_query):
+            return AgentName.NEWS, _extract_symbol_from_text(user_query) or _company_alias_to_ticker(user_query)
+        if _looks_like_tax_query(user_query):
+            return AgentName.TAX_EDUCATION, None
+        if _looks_like_goal_planning_query(user_query):
+            return AgentName.GOAL_PLANNING, None
         return AgentName.FINANCE_QA, None
 
     data = _safe_json_loads(str(text).strip())
     if not isinstance(data, dict):
         logger.warning("LLM router returned non-JSON; falling back. text=%r", text)
-        if _looks_like_market_query(user_query):
-            return AgentName.MARKET, _extract_symbol_from_text(user_query) or _company_alias_to_ticker(user_query)
+        if _looks_like_news_query(user_query):
+            return AgentName.NEWS, _extract_symbol_from_text(user_query) or _company_alias_to_ticker(user_query)
+        if _looks_like_tax_query(user_query):
+            return AgentName.TAX_EDUCATION, None
+        if _looks_like_goal_planning_query(user_query):
+            return AgentName.GOAL_PLANNING, None
         return AgentName.FINANCE_QA, None
 
     agent_raw = str(data.get("agent", "")).strip().lower()
@@ -238,6 +453,12 @@ def _llm_route_text(user_query: str) -> Tuple[AgentName, Optional[str]]:
         return AgentName.MARKET, symbol
     if agent_raw == "portfolio":
         return AgentName.PORTFOLIO, symbol
+    if agent_raw == "goal_planning":
+        return AgentName.GOAL_PLANNING, symbol
+    if agent_raw == "news":
+        return AgentName.NEWS, symbol
+    if agent_raw == "tax_education":
+        return AgentName.TAX_EDUCATION, symbol
     return AgentName.FINANCE_QA, symbol
 
 
@@ -341,6 +562,27 @@ def run(raw: Union[str, Dict[str, Any], RouterRequest]) -> RouterResult:
             # Rewrite query to include ticker so the market agent extractor works reliably.
             query = f"{req.resolved_symbol} {req.user_query}"
         output = run_market_analysis_agent(query)
+        return RouterResult(agent=agent, output=output)
+
+    if agent == AgentName.GOAL_PLANNING:
+        from src.agents.goal_planning_agent import run_goal_planning_agent
+
+        assert req.user_query is not None
+        output = run_goal_planning_agent(req.user_query)
+        return RouterResult(agent=agent, output=output)
+
+    if agent == AgentName.NEWS:
+        from src.agents.news_agent import run_news_agent
+
+        assert req.user_query is not None
+        output = run_news_agent(req.user_query)
+        return RouterResult(agent=agent, output=output)
+
+    if agent == AgentName.TAX_EDUCATION:
+        from src.agents.tax_education import run_tax_education_agent
+
+        assert req.user_query is not None
+        output = run_tax_education_agent(req.user_query)
         return RouterResult(agent=agent, output=output)
 
     # Defensive (should be unreachable)

@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 import sys
 from pathlib import Path
 from typing import Any, Dict
@@ -17,12 +19,17 @@ load_env()
 
 import streamlit as st
 import pandas as pd
+import yfinance as yf
+from streamlit_autorefresh import st_autorefresh
 
 from src.core.config import load_settings
 from src.utils.logging import setup_logging
 from src.agents.finance_qa_agent import run_finance_qa_agent
 from src.agents.portfolio_agent import run_portfolio_agent
 from src.agents.market_analysis_agent import run_market_analysis_agent
+from src.agents.goal_planning_agent import run_goal_planning_agent
+from src.agents.news_agent import run_news_agent
+from src.agents.tax_education import run_tax_education_agent
 from src.workflow.router import RouterError, run as run_router, AgentName
 
 
@@ -145,10 +152,364 @@ def render_market_result(result: Dict[str, Any]) -> None:
     st.caption(result.get("disclaimer", ""))
 
 
+def render_news_result(result: Dict[str, Any]) -> None:
+    st.markdown(result.get("answer", ""))
+
+    sym = result.get("symbol")
+    if sym:
+        st.caption(f"Resolved symbol: {sym}")
+
+    st.subheader("Sources")
+    render_sources(result.get("sources", []))
+    st.caption(result.get("disclaimer", ""))
+
+
+def render_tax_result(result: Dict[str, Any]) -> None:
+    st.markdown(result.get("answer", ""))
+
+    st.subheader("Sources")
+    render_sources(result.get("sources", []))
+    st.caption(result.get("disclaimer", ""))
+
+
+# ------------------- Goal Planning Projection Helpers -------------------
+
+def _infer_month_horizon(text: str) -> int:
+    """Infer a month horizon from free text like '12 months' or '3 years'. Defaults to 12."""
+    if not text:
+        return 12
+
+    t = text.lower()
+
+    m = re.search(r"\b(\d{1,3})\s*(months?|mos?|mo)\b", t)
+    if m:
+        return max(1, min(360, int(m.group(1))))
+
+    y = re.search(r"\b(\d{1,2})\s*(years?|yrs?|yr)\b", t)
+    if y:
+        return max(1, min(360, int(y.group(1)) * 12))
+
+    return 12
+
+
+def _build_goal_projection(inputs: Dict[str, Any]) -> pd.DataFrame | None:
+    """Build a monthly savings projection dataframe if we have enough inputs.
+
+    This is a simple linear projection (no investment returns assumed).
+    """
+    if not isinstance(inputs, dict):
+        return None
+
+    target_amount = inputs.get("target_amount")
+    current_savings = inputs.get("current_savings")
+    monthly_contribution = inputs.get("monthly_contribution")
+    target_date = inputs.get("target_date")
+
+    try:
+        target = float(target_amount)
+    except Exception:
+        return None
+
+    start = 0.0
+    try:
+        if current_savings is not None:
+            start = float(current_savings)
+    except Exception:
+        start = 0.0
+
+    months = _infer_month_horizon(str(target_date or ""))
+    months = max(1, months)
+
+    # If monthly contribution not provided, compute required monthly to hit target in horizon
+    if monthly_contribution is None:
+        needed = max(0.0, target - start)
+        monthly = needed / float(months)
+    else:
+        try:
+            monthly = float(monthly_contribution)
+        except Exception:
+            monthly = max(0.0, target - start) / float(months)
+
+    balances = [start + monthly * i for i in range(months + 1)]
+
+    return pd.DataFrame(
+        {
+            "month": list(range(0, months + 1)),
+            "projected_savings": balances,
+            "target": [target] * (months + 1),
+        }
+    )
+
+# ------------------- Goal Planning Renderer -------------------
+def render_goal_planning_result(result: Dict[str, Any]) -> None:
+    st.markdown(result.get("answer", ""))
+
+    inputs = result.get("inputs")
+    if isinstance(inputs, dict) and inputs:
+        st.subheader("Parsed goal inputs")
+        # Show only non-null fields
+        cleaned = {k: v for k, v in inputs.items() if v is not None and v != ""}
+        if cleaned:
+            st.json(cleaned)
+        else:
+            st.caption("No structured inputs were extracted.")
+
+    # Timechart: projected savings vs target
+    if isinstance(inputs, dict) and inputs:
+        proj_df = _build_goal_projection(inputs)
+        if proj_df is not None:
+            st.subheader("Projection (monthly)")
+            st.caption("Simple linear projection (no investment returns assumed).")
+            st.line_chart(proj_df.set_index("month")[["projected_savings", "target"]])
+
+    st.subheader("Sources")
+    render_sources(result.get("sources", []))
+    st.caption(result.get("disclaimer", ""))
+
+
+# -----------------------------
+# Ticker tape (top-of-page)
+# -----------------------------
+
+TOP10_TICKERS = ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "BRK-B", "AVGO", "JPM"]
+
+
+@st.cache_data(ttl=300)
+def fetch_ticker_tape(tickers: list[str]) -> pd.DataFrame:
+    """Fetch latest daily close + day-over-day change for a list of tickers.
+
+    Uses daily bars (period=2d) so it works consistently outside market hours.
+    Cached for 5 minutes to avoid repeated downloads on Streamlit reruns.
+    """
+    df = yf.download(
+        tickers=" ".join(tickers),
+        period="2d",
+        interval="1d",
+        group_by="ticker",
+        auto_adjust=False,
+        progress=False,
+        threads=False,
+    )
+
+    rows: list[dict[str, Any]] = []
+
+    for t in tickers:
+        try:
+            tdf = df[t] if isinstance(df.columns, pd.MultiIndex) else df
+            tdf = tdf.dropna()
+            if len(tdf.index) == 0:
+                raise ValueError("empty")
+
+            last_close = float(tdf.iloc[-1]["Close"])
+            prev_close = float(tdf.iloc[-2]["Close"]) if len(tdf.index) >= 2 else last_close
+            chg = last_close - prev_close
+            chg_pct = (chg / prev_close) * 100.0 if prev_close else 0.0
+
+            rows.append(
+                {
+                    "ticker": t,
+                    "price": last_close,
+                    "chg": chg,
+                    "chg_pct": chg_pct,
+                }
+            )
+        except Exception:
+            rows.append({"ticker": t, "price": None, "chg": None, "chg_pct": None})
+
+    return pd.DataFrame(rows)
+
+
+# ------------------- Top Finance Headlines Helper -------------------
+
+@st.cache_data(ttl=300)
+def fetch_top_finance_headlines(limit: int = 3) -> list[dict[str, str]]:
+    """Fetch top finance news headlines.
+
+    Goal: return up to `limit` *article* headlines (avoid section/home pages).
+
+    Sources:
+    1) Tavily web search (if TAVILY_API_KEY is set)
+    2) Yahoo Finance headlines via yfinance (fallback / top-up)
+
+    Returns: list of {title, url}
+    """
+
+    def is_bad_title(tt: str) -> bool:
+        t = (tt or "").lower()
+        bad_phrases = [
+            "latest finance news",
+            "today's top headlines",
+            "finance and markets",
+            "markets -",
+            "market news",
+            "stock market news",
+            "breaking news",
+            "latest news",
+            "finance news",
+            "markets news",
+            "- wsj.com",
+            "wsj.com",
+        ]
+        return any(p in t for p in bad_phrases)
+
+    def looks_like_directory(u: str) -> bool:
+        uu = (u or "").lower().rstrip("/")
+        if not uu:
+            return True
+        # reject obvious section pages / home pages
+        bad_endings = [
+            "/finance",
+            "/markets",
+            "/market",
+            "/news",
+            "/business",
+            "/business/news",
+            "/world",
+        ]
+        if uu.endswith(tuple(bad_endings)):
+            return True
+        try:
+            from urllib.parse import urlparse
+
+            p = urlparse(u).path.rstrip("/")
+            if p in ("", "/finance", "/markets", "/news", "/business"):
+                return True
+            # article URLs tend to have longer paths
+            return len([seg for seg in p.split("/") if seg]) <= 2
+        except Exception:
+            return False
+
+    out: list[dict[str, str]] = []
+    seen: set[str] = set()
+
+    def add_item(title: str, url: str) -> None:
+        t = (title or "").strip()
+        u = (url or "").strip()
+        if not t or not u:
+            return
+        if is_bad_title(t):
+            return
+        if looks_like_directory(u):
+            return
+        if u in seen:
+            return
+        seen.add(u)
+        out.append({"title": t, "url": u})
+
+    # 1) Tavily
+    tavily_key = os.getenv("TAVILY_API_KEY")
+    if tavily_key:
+        try:
+            import requests  # type: ignore
+
+            url = "https://api.tavily.com/search"
+            headers = {"Content-Type": "application/json", "Authorization": f"Bearer {tavily_key}"}
+            payload = {
+                "query": "top finance market stories today (stocks bonds rates inflation earnings) Reuters CNBC Bloomberg",
+                "search_depth": "advanced",
+                "max_results": 12,
+                "include_answer": False,
+                "include_raw_content": False,
+            }
+            resp = requests.post(url, headers=headers, data=json.dumps(payload), timeout=12)
+            if resp.status_code == 200:
+                data = resp.json()
+                for r in (data.get("results") or [])[:20]:
+                    add_item(str(r.get("title") or ""), str(r.get("url") or ""))
+                    if len(out) >= limit:
+                        break
+        except Exception:
+            pass
+
+    # 2) Yahoo Finance (top-up)
+    if len(out) < limit:
+        try:
+            t = yf.Ticker("SPY")  # broad market proxy
+            raw = getattr(t, "news", None) or []
+            for r in raw[:25]:
+                title = str(r.get("title") or "")
+                link = str(r.get("link") or r.get("url") or "")
+                add_item(title, link)
+                if len(out) >= limit:
+                    break
+        except Exception:
+            pass
+
+    return out[:limit]
+
+
+def render_ticker_tape(df: pd.DataFrame) -> None:
+    parts: list[str] = []
+    for _, r in df.iterrows():
+        t = str(r.get("ticker"))
+        price = r.get("price")
+        if price is None or (isinstance(price, float) and pd.isna(price)):
+            parts.append(f"{t}: N/A")
+            continue
+        chg = float(r.get("chg") or 0.0)
+        chg_pct = float(r.get("chg_pct") or 0.0)
+        parts.append(f"{t}: ${float(price):.2f} ({chg:+.2f}, {chg_pct:+.2f}%)")
+
+    tape = "  •  ".join(parts)
+
+    st.markdown(
+        f"""
+        <div style="
+            padding: 10px 12px;
+            border: 1px solid rgba(255,255,255,0.15);
+            border-radius: 10px;
+            background: rgba(255,255,255,0.03);
+            white-space: nowrap;
+            overflow: hidden;
+        ">
+            <div style="
+                display: inline-block;
+                will-change: transform;
+                animation: scroll 28s linear infinite;
+            ">{tape} &nbsp;&nbsp;&nbsp; {tape}</div>
+        </div>
+
+        <style>
+        @keyframes scroll {{
+            0%   {{ transform: translateX(0%); }}
+            100% {{ transform: translateX(-50%); }}
+        }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 # --- UI starts immediately at top-level (this is the key fix) ---
 st.set_page_config(page_title="AI Finance Assistant", layout="centered")
 st.title("AI Finance Assistant (MVP)")
 st.caption("Educational only. No personalized financial, tax, or legal advice.")
+
+# Auto-refresh the app every 5 minutes so the ticker tape updates.
+st_autorefresh(interval=300_000, key="ticker_tape_refresh")
+
+with st.container():
+    st.caption("Top tickers (updates every ~5 minutes)")
+    tape_df = fetch_ticker_tape(TOP10_TICKERS)
+    render_ticker_tape(tape_df)
+
+# Top 3 finance news (titles only)
+headlines = fetch_top_finance_headlines(limit=3)
+
+# Filter out empty titles defensively
+clean_headlines = [h for h in (headlines or []) if str(h.get("title") or "").strip()]
+
+if clean_headlines:
+    st.caption("Top finance headlines")
+    for i, h in enumerate(clean_headlines[:3], start=1):
+        title = str(h.get("title") or "").strip()
+        url = str(h.get("url") or "").strip()
+        if title and url:
+            st.markdown(f"{i}. [{title}]({url})")
+        elif title:
+            st.markdown(f"{i}. {title}")
+else:
+    st.caption("Top finance headlines: unavailable.")
 
 # Load config + logging and show errors in UI
 try:
@@ -161,8 +522,8 @@ except Exception as e:
     st.stop()
 
 # Tabs
-auto_tab, qa_tab, portfolio_tab, market_tab = st.tabs(
-    ["Auto", "Finance Q&A", "Portfolio Analysis", "Market Analysis"]
+auto_tab, qa_tab, portfolio_tab, market_tab, goal_tab, news_tab, tax_tab = st.tabs(
+    ["Auto", "Finance Q&A", "Portfolio Analysis", "Market Analysis", "Goal Planning", "News", "Tax"]
 )
 
 with auto_tab:
@@ -184,7 +545,7 @@ with auto_tab:
 
     st.markdown("**Input** (either a question *or* a portfolio JSON payload)")
     auto_text = st.text_area(
-        "",
+        "Input",
         value=st.session_state.auto_input,
         height=220,
         placeholder="Type a question like: What is an ETF?\n\nOr paste JSON like:\n" + json.dumps(example_portfolio, indent=2),
@@ -252,6 +613,15 @@ with auto_tab:
 
         elif routed.agent == AgentName.MARKET:
             render_market_result(routed.output)
+
+        elif routed.agent == AgentName.GOAL_PLANNING:
+            render_goal_planning_result(routed.output)
+
+        elif routed.agent == AgentName.NEWS:
+            render_news_result(routed.output)
+
+        elif routed.agent == AgentName.TAX_EDUCATION:
+            render_tax_result(routed.output)
 
         with st.expander("Debug (raw JSON)"):
             st.code(json.dumps({"agent": routed.agent.value, "output": routed.output}, indent=2), language="json")
@@ -389,6 +759,111 @@ with market_tab:
             st.stop()
 
         render_market_result(result)
+
+        with st.expander("Debug (raw JSON)"):
+            st.code(json.dumps(result, indent=2), language="json")
+
+
+# ------------------- Goal Planning Tab -------------------
+with goal_tab:
+    st.subheader("Goal Planning")
+    st.caption("Set a savings goal and get a practical plan (monthly target, checklist, and follow-ups).")
+
+    if "goal_query" not in st.session_state:
+        st.session_state.goal_query = "I want to save $10,000 in 12 months. What should my monthly savings target be?"
+
+    goal_query = st.text_input(
+        "Describe your goal",
+        value=st.session_state.goal_query,
+    )
+
+    run_goal = st.button("Build goal plan")
+
+    if run_goal:
+        st.session_state.goal_query = goal_query
+        q = (goal_query or "").strip()
+        if not q:
+            st.warning("Enter a goal description.")
+            st.stop()
+
+        try:
+            result: Dict[str, Any] = run_goal_planning_agent(q)
+        except Exception as e:
+            st.error("Goal planning agent crashed.")
+            st.exception(e)
+            st.stop()
+
+        render_goal_planning_result(result)
+
+        with st.expander("Debug (raw JSON)"):
+            st.code(json.dumps(result, indent=2), language="json")
+
+
+# ------------------- News Tab -------------------
+with news_tab:
+    st.subheader("News")
+    st.caption("Summarize and contextualize financial news using Yahoo Finance headlines + Tavily web search (if configured).")
+
+    if "news_query" not in st.session_state:
+        st.session_state.news_query = "Tesla news this week"
+
+    news_query = st.text_input(
+        "Ask for news (e.g., 'Tesla news this week', 'Fed rate cut headlines')",
+        value=st.session_state.news_query,
+    )
+
+    run_news = st.button("Get news summary")
+
+    if run_news:
+        st.session_state.news_query = news_query
+        q = (news_query or "").strip()
+        if not q:
+            st.warning("Enter a news query.")
+            st.stop()
+
+        try:
+            result: Dict[str, Any] = run_news_agent(q)
+        except Exception as e:
+            st.error("News agent crashed.")
+            st.exception(e)
+            st.stop()
+
+        render_news_result(result)
+
+        with st.expander("Debug (raw JSON)"):
+            st.code(json.dumps(result, indent=2), language="json")
+
+
+# ------------------- Tax Tab -------------------
+with tax_tab:
+    st.subheader("Tax Education")
+    st.caption("Explain tax concepts and account types (education only).")
+
+    if "tax_query" not in st.session_state:
+        st.session_state.tax_query = "Roth IRA vs Traditional IRA"
+
+    tax_query = st.text_input(
+        "Ask a tax question (e.g., 'capital gains tax', 'wash sale rule', 'HSA vs FSA')",
+        value=st.session_state.tax_query,
+    )
+
+    run_tax = st.button("Explain tax concept")
+
+    if run_tax:
+        st.session_state.tax_query = tax_query
+        q = (tax_query or "").strip()
+        if not q:
+            st.warning("Enter a tax question.")
+            st.stop()
+
+        try:
+            result: Dict[str, Any] = run_tax_education_agent(q)
+        except Exception as e:
+            st.error("Tax agent crashed.")
+            st.exception(e)
+            st.stop()
+
+        render_tax_result(result)
 
         with st.expander("Debug (raw JSON)"):
             st.code(json.dumps(result, indent=2), language="json")
