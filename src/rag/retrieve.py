@@ -1,17 +1,11 @@
-# src/rag/retrieve.py
-from __future__ import annotations
-
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple
 
 from functools import lru_cache
-import math
-
-
-import chromadb
-from chromadb.errors import InvalidCollectionException
-from sentence_transformers import SentenceTransformer
+import os
+import re
+from collections import Counter
 
 from src.utils.logging import get_logger
 
@@ -27,91 +21,19 @@ class RetrievedChunk:
     score: Optional[float] = None  # Chroma distances/similarity depending on config
 
 
-class ChromaRetriever:
+class InMemoryRetriever:
+    """Stdlib-only fallback retriever.
+
+    Uses a simple TF-IDF-ish cosine over token counts. This is not as strong as
+    embeddings, but it is deterministic and removes heavy deps.
     """
-    Minimal retriever for MVP:
-    - Loads a persisted Chroma collection (created by src/rag/ingest.py)
-    - Embeds query using sentence-transformers
-    - Returns top-k chunks with metadata for citations
-    """
 
-    def __init__(
-        self,
-        *,
-        persist_dir: Path,
-        collection_name: str = "finance_kb",
-        embedding_model_name: str = "all-MiniLM-L6-v2",
-    ) -> None:
-        self.persist_dir = persist_dir
-        self.collection_name = collection_name
-        self.model = SentenceTransformer(embedding_model_name)
+    def __init__(self, *, kb_dir: Path) -> None:
+        self.kb_dir = kb_dir
+        self._texts, self._metas = self._kb_corpus(kb_dir)
+        self._doc_vecs = [self._tf(t) for t in self._texts]
 
-        self.client = chromadb.PersistentClient(path=str(persist_dir))
-        self.collection = self.client.get_or_create_collection(name=collection_name)
-
-        # Auto-ingest KB if the collection is empty (common on Streamlit Community Cloud)
-        try:
-            existing = self.collection.count()  # type: ignore[attr-defined]
-        except InvalidCollectionException:
-            # Stale handle: recreate collection then treat as empty
-            logger.warning("Chroma collection stale during count(); recreating handle")
-            self.client = chromadb.PersistentClient(path=str(self.persist_dir))
-            self.collection = self.client.get_or_create_collection(name=self.collection_name)
-            try:
-                existing = self.collection.count()  # type: ignore[attr-defined]
-            except Exception:
-                existing = 0
-        except Exception:
-            existing = 0
-
-        if existing == 0:
-            repo_root = Path(__file__).resolve().parents[2]
-            kb_dir = repo_root / "src" / "data" / "knowledge_base"
-            persist_dir2 = repo_root / "src" / "data" / "chroma"
-
-            logger.info(
-                "Chroma collection '%s' is empty. Attempting auto-ingest from kb_dir=%s into persist_dir=%s",
-                collection_name,
-                kb_dir,
-                persist_dir2,
-            )
-
-            try:
-                if kb_dir.exists():
-                    try:
-                        kb_files = sorted([p.name for p in kb_dir.glob("*.md")])
-                    except Exception:
-                        kb_files = []
-                    logger.info("KB markdown files found (%s): %s", len(kb_files), kb_files)
-                else:
-                    logger.warning("KB directory does not exist: %s", kb_dir)
-
-                from src.rag.ingest import ingest_markdown_kb
-
-                n = ingest_markdown_kb(
-                    kb_dir=kb_dir,
-                    persist_dir=persist_dir2,
-                    collection_name=collection_name,
-                    rebuild=False,
-                )
-
-                # Re-open collection after ingest
-                self.persist_dir = persist_dir2
-                self.client = chromadb.PersistentClient(path=str(persist_dir2))
-                self.collection = self.client.get_or_create_collection(name=collection_name)
-
-                try:
-                    after = self.collection.count()  # type: ignore[attr-defined]
-                except Exception:
-                    after = None
-
-                logger.info(
-                    "Auto-ingest finished. Ingested=%s. Collection count after ingest=%s",
-                    n,
-                    after,
-                )
-            except Exception:
-                logger.exception("Chroma collection empty and auto-ingest failed")
+        logger.info("InMemoryRetriever initialized docs=%s kb_dir=%s", len(self._texts), kb_dir)
 
     @staticmethod
     def _read_markdown_file(p: Path) -> str:
@@ -120,25 +42,44 @@ class ChromaRetriever:
         except Exception:
             return p.read_text(errors="ignore")
 
-    def _kb_dir(self) -> Path:
-        repo_root = Path(__file__).resolve().parents[2]
-        return repo_root / "src" / "data" / "knowledge_base"
+    @staticmethod
+    def _tokenize(text: str) -> List[str]:
+        # keep it simple: lowercase words/numbers
+        return re.findall(r"[a-z0-9]+", text.lower())
 
+    @staticmethod
+    def _tf(text: str) -> Counter:
+        return Counter(InMemoryRetriever._tokenize(text))
+
+    @staticmethod
+    def _cosine_counts(a: Counter, b: Counter) -> float:
+        # cosine similarity for sparse count vectors
+        if not a or not b:
+            return 0.0
+        dot = 0.0
+        na = 0.0
+        nb = 0.0
+        for k, av in a.items():
+            na += float(av * av)
+            bv = b.get(k)
+            if bv:
+                dot += float(av * bv)
+        for bv in b.values():
+            nb += float(bv * bv)
+        if na <= 0.0 or nb <= 0.0:
+            return 0.0
+        return dot / ((na ** 0.5) * (nb ** 0.5))
+
+    @staticmethod
     @lru_cache(maxsize=1)
-    def _kb_corpus(self) -> Tuple[List[str], List[dict]]:
-        """Load KB markdown documents for fallback retrieval.
-
-        Returns (texts, metadatas)
-        """
-        kb_dir = self._kb_dir()
+    def _kb_corpus(kb_dir: Path) -> Tuple[List[str], List[dict]]:
         files = sorted(kb_dir.glob("*.md"))
         texts: List[str] = []
         metas: List[dict] = []
         for f in files:
-            raw = self._read_markdown_file(f).strip()
+            raw = InMemoryRetriever._read_markdown_file(f).strip()
             if not raw:
                 continue
-            # crude title: first markdown heading if present
             title = f.stem.replace("_", " ")
             for line in raw.splitlines()[:20]:
                 if line.strip().startswith("#"):
@@ -148,151 +89,217 @@ class ChromaRetriever:
             metas.append({"title": title, "source": f.name, "url": None})
         return texts, metas
 
-    def _cosine_similarity(self, a: List[float], b: List[float]) -> float:
-        dot = 0.0
-        na = 0.0
-        nb = 0.0
-        for x, y in zip(a, b):
-            dot += x * y
-            na += x * x
-            nb += y * y
-        if na <= 0.0 or nb <= 0.0:
-            return 0.0
-        return dot / (math.sqrt(na) * math.sqrt(nb))
-
-    def _inmemory_retrieve(self, query: str, top_k: int) -> List[RetrievedChunk]:
-        """Fallback retrieval that does not depend on Chroma."""
-        texts, metas = self._kb_corpus()
-        if not texts:
+    def retrieve(self, query: str, top_k: int = 5) -> List[RetrievedChunk]:
+        if not query.strip() or not self._texts:
             return []
 
-        q = self.model.encode([query]).tolist()[0]
-        embs = self.model.encode(texts).tolist()
+        qv = self._tf(query)
 
         scored: List[Tuple[float, int]] = []
-        for i, e in enumerate(embs):
-            scored.append((self._cosine_similarity(q, e), i))
+        for i, dv in enumerate(self._doc_vecs):
+            scored.append((self._cosine_counts(qv, dv), i))
         scored.sort(reverse=True, key=lambda t: t[0])
 
         out: List[RetrievedChunk] = []
         for sim, i in scored[: max(1, top_k)]:
-            meta = metas[i] if i < len(metas) else {}
+            meta = self._metas[i] if i < len(self._metas) else {}
             out.append(
                 RetrievedChunk(
-                    text=str(texts[i]),
+                    text=str(self._texts[i]),
                     title=str(meta.get("title", "Unknown")),
                     source=str(meta.get("source", "Unknown")),
                     url=meta.get("url") or None,
-                    score=float(1.0 - sim),  # keep 'distance-like' semantics (lower is better)
+                    score=float(1.0 - sim),
                 )
             )
         return out
 
-    def _safe_query(self, q_emb: list[float], top_k: int):
-        """Run a Chroma query and recover from stale collection handles."""
+
+class PineconeRetriever:
+    """Pinecone-backed retriever for Streamlit Cloud stability.
+
+    Uses Pinecone integrated embeddings (text upsert + text query).
+    Automatically upserts the local markdown KB on first run if the namespace is empty.
+
+    Env vars:
+      - PINECONE_API_KEY
+      - PINECONE_INDEX_NAME
+      - PINECONE_NAMESPACE (optional, default: finance_kb)
+    """
+
+    def __init__(
+        self,
+        *,
+        kb_dir: Path,
+        index_name: str,
+        namespace: str = "finance_kb",
+        chunk_chars: int = 1200,
+        chunk_overlap: int = 200,
+    ) -> None:
+        self.kb_dir = kb_dir
+        self.index_name = index_name
+        self.namespace = namespace
+        self.chunk_chars = chunk_chars
+        self.chunk_overlap = chunk_overlap
+
+        api_key = os.environ.get("PINECONE_API_KEY", "").strip()
+        if not api_key:
+            raise RuntimeError("PINECONE_API_KEY is not set")
+
+        # Import here to keep module import stable if pinecone is not installed in some envs
+        from pinecone import Pinecone
+
+        self._pc = Pinecone(api_key=api_key)
+        self._index = self._pc.Index(index_name)
+
+        self._ensure_index_populated()
+
+        logger.info(
+            "PineconeRetriever initialized index=%s namespace=%s kb_dir=%s",
+            index_name,
+            namespace,
+            kb_dir,
+        )
+
+    @staticmethod
+    def _read_markdown_file(p: Path) -> str:
         try:
-            return self.collection.query(
-                query_embeddings=[q_emb],
-                n_results=top_k,
-                include=["documents", "metadatas", "distances"],
-            )
-        except InvalidCollectionException:
-            logger.warning("Chroma collection handle is stale; recreating and retrying query")
-            self.client = chromadb.PersistentClient(path=str(self.persist_dir))
-            self.collection = self.client.get_or_create_collection(name=self.collection_name)
-            return self.collection.query(
-                query_embeddings=[q_emb],
-                n_results=top_k,
-                include=["documents", "metadatas", "distances"],
-            )
+            return p.read_text(encoding="utf-8")
+        except Exception:
+            return p.read_text(errors="ignore")
+
+    def _chunk_text(self, text: str) -> List[str]:
+        t = text.strip()
+        if not t:
+            return []
+        if len(t) <= self.chunk_chars:
+            return [t]
+        chunks: List[str] = []
+        step = max(1, self.chunk_chars - self.chunk_overlap)
+        for start in range(0, len(t), step):
+            chunk = t[start : start + self.chunk_chars].strip()
+            if chunk:
+                chunks.append(chunk)
+            if start + self.chunk_chars >= len(t):
+                break
+        return chunks
+
+    def _load_kb_chunks(self) -> Tuple[List[str], List[dict], List[str]]:
+        files = sorted(self.kb_dir.glob("*.md"))
+        texts: List[str] = []
+        metas: List[dict] = []
+        ids: List[str] = []
+
+        for f in files:
+            raw = self._read_markdown_file(f)
+            if not raw.strip():
+                continue
+
+            title = f.stem.replace("_", " ")
+            for line in raw.splitlines()[:20]:
+                if line.strip().startswith("#"):
+                    title = line.strip().lstrip("#").strip() or title
+                    break
+
+            for i, chunk in enumerate(self._chunk_text(raw)):
+                chunk_id = f"{f.name}::chunk_{i}"
+                texts.append(chunk)
+                metas.append({"title": title, "source": f.name, "url": None})
+                ids.append(chunk_id)
+
+        return texts, metas, ids
+
+    def _namespace_count(self) -> int:
+        try:
+            stats = self._index.describe_index_stats()
+            ns = (stats or {}).get("namespaces", {}) or {}
+            info = ns.get(self.namespace, {}) or {}
+            return int(info.get("vector_count", 0) or 0)
+        except Exception:
+            return 0
+
+    def _ensure_index_populated(self) -> None:
+        count = self._namespace_count()
+        if count > 0:
+            return
+
+        texts, metas, ids = self._load_kb_chunks()
+        if not texts:
+            logger.warning("No KB chunks found in %s; Pinecone will be empty", self.kb_dir)
+            return
+
+        logger.info("Pinecone namespace empty; upserting %s chunks into %s/%s", len(texts), self.index_name, self.namespace)
+
+        batch = 100
+        for i in range(0, len(texts), batch):
+            records = []
+            for j in range(i, min(i + batch, len(texts))):
+                md = dict(metas[j])
+                md["text"] = texts[j]
+                records.append(
+                    {
+                        "id": ids[j],
+                        "text": texts[j],
+                        "metadata": md,
+                    }
+                )
+            # record upsert lets Pinecone embed the `text` field server-side
+            self._index.upsert(records=records, namespace=self.namespace)
 
     def retrieve(self, query: str, top_k: int = 5) -> List[RetrievedChunk]:
         if not query.strip():
             return []
 
-        q_emb = self.model.encode([query]).tolist()[0]
+        res = self._index.query(
+            query={"text": query},
+            top_k=top_k,
+            include_metadata=True,
+            namespace=self.namespace,
+        )
 
-        try:
-            res = self._safe_query(q_emb, top_k)
-        except InvalidCollectionException:
-            logger.warning("Chroma query failed with InvalidCollectionException; using in-memory KB fallback")
-            return self._inmemory_retrieve(query, top_k)
+        matches = (res or {}).get("matches", []) or []
 
-        docs = res.get("documents", [[]])[0] or []
-
-        if not docs:
-            # If Chroma returns nothing, prefer a usable answer via in-memory KB.
-            fallback = self._inmemory_retrieve(query, top_k)
-            if fallback:
-                logger.info("Chroma returned 0 docs; using in-memory KB fallback")
-                return fallback
-
-        # If nothing was retrieved, it's often because the collection is empty in a fresh deployment.
-        if not docs:
-            try:
-                cnt = self.collection.count()  # type: ignore[attr-defined]
-            except InvalidCollectionException:
-                logger.warning("Chroma collection stale during count() in retrieve(); recreating handle")
-                self.client = chromadb.PersistentClient(path=str(self.persist_dir))
-                self.collection = self.client.get_or_create_collection(name=self.collection_name)
-                try:
-                    cnt = self.collection.count()  # type: ignore[attr-defined]
-                except Exception:
-                    cnt = 0
-            except Exception:
-                cnt = 0
-
-            if cnt == 0:
-                try:
-                    repo_root = Path(__file__).resolve().parents[2]
-                    kb_dir = repo_root / "src" / "data" / "knowledge_base"
-                    persist_dir2 = repo_root / "src" / "data" / "chroma"
-                    from src.rag.ingest import ingest_markdown_kb
-
-                    logger.info("Retrieve got 0 docs and collection count=0. Retrying auto-ingest...")
-                    ingest_markdown_kb(
-                        kb_dir=kb_dir,
-                        persist_dir=persist_dir2,
-                        collection_name=self.collection_name,
-                        rebuild=False,
-                    )
-
-                    # Re-open collection after ingest (important on Cloud)
-                    self.persist_dir = persist_dir2
-                    self.client = chromadb.PersistentClient(path=str(persist_dir2))
-                    self.collection = self.client.get_or_create_collection(name=self.collection_name)
-
-                    # retry the query once
-                    res = self._safe_query(q_emb, top_k)
-                    docs = res.get("documents", [[]])[0] or []
-                except Exception:
-                    logger.exception("Retry auto-ingest during retrieve failed")
-        metas = res.get("metadatas", [[]])[0] or []
-        dists = res.get("distances", [[]])[0] or []
-
-        chunks: List[RetrievedChunk] = []
-        for doc, meta, dist in zip(docs, metas, dists):
-            title = (meta or {}).get("title", "Unknown")
-            source = (meta or {}).get("source", "Unknown")
-            url = (meta or {}).get("url") or None
-            chunks.append(
+        out: List[RetrievedChunk] = []
+        for m in matches:
+            meta = (m or {}).get("metadata", {}) or {}
+            title = meta.get("title", "Unknown")
+            source = meta.get("source", "Unknown")
+            url = meta.get("url") or None
+            # Pinecone returns similarity score (higher is better). Convert to distance-like.
+            sim = float((m or {}).get("score", 0.0) or 0.0)
+            out.append(
                 RetrievedChunk(
-                    text=str(doc),
+                    text=str(meta.get("text", "")) if meta.get("text") else "",  # optional if you store text
                     title=str(title),
                     source=str(source),
                     url=url,
-                    score=float(dist) if dist is not None else None,
+                    score=float(1.0 - sim),
                 )
             )
 
-        return chunks
+        return out
 
 
-def default_retriever() -> ChromaRetriever:
-    """
-    Convenience constructor using the repo's default persisted path:
-      src/data/chroma
+def default_retriever():
+    """Default retriever.
+
+    Preference order:
+      1) Pinecone (if PINECONE_API_KEY and PINECONE_INDEX_NAME are set)
+      2) In-memory markdown retrieval
+
+    This avoids Chroma/SQLite issues on Streamlit Community Cloud.
     """
     repo_root = Path(__file__).resolve().parents[2]
-    persist_dir = repo_root / "src" / "data" / "chroma"
-    return ChromaRetriever(persist_dir=persist_dir)
+    kb_dir = repo_root / "src" / "data" / "knowledge_base"
+
+    api_key = os.environ.get("PINECONE_API_KEY", "").strip()
+    index_name = os.environ.get("PINECONE_INDEX_NAME", "").strip()
+    namespace = os.environ.get("PINECONE_NAMESPACE", "finance_kb").strip() or "finance_kb"
+
+    if api_key and index_name:
+        try:
+            return PineconeRetriever(kb_dir=kb_dir, index_name=index_name, namespace=namespace)
+        except Exception as e:
+            logger.warning("Failed to init PineconeRetriever (%s). Falling back to InMemoryRetriever.", e)
+
+    return InMemoryRetriever(kb_dir=kb_dir)

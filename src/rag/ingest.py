@@ -3,10 +3,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import List, Optional
+import os
 
-import chromadb
-from sentence_transformers import SentenceTransformer
+from pinecone import Pinecone
 
 
 @dataclass(frozen=True)
@@ -70,64 +70,69 @@ def load_markdown_docs(kb_dir: Path) -> List[DocChunk]:
     return chunks
 
 
-def ingest_markdown_kb(
+def upsert_kb_to_pinecone(
+    *,
     kb_dir: Path,
-    persist_dir: Path,
-    collection_name: str = "finance_kb",
-    model_name: str = "all-MiniLM-L6-v2",
-    rebuild: bool = False,
+    index_name: str,
+    namespace: str = "finance_kb",
+    batch_size: int = 100,
 ) -> int:
-    """Ingest markdown KB into a persistent Chroma collection.
+    """Upsert markdown KB chunks into a Pinecone index using *integrated embeddings*.
 
-    - rebuild=False (default): upsert/update docs without wiping the collection
-    - rebuild=True: delete and recreate the collection (useful locally)
+    This assumes your Pinecone index is configured with an integrated embedding model
+    (e.g., llama-text-embed-v2) and that the record field to embed is named `text`.
 
-    Returns number of chunks ingested.
+    Env var required:
+      - PINECONE_API_KEY
+
+    Returns number of chunks upserted.
     """
+    api_key = os.environ.get("PINECONE_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("PINECONE_API_KEY is not set")
+
     kb_dir.mkdir(parents=True, exist_ok=True)
-    persist_dir.mkdir(parents=True, exist_ok=True)
 
     docs = load_markdown_docs(kb_dir)
     if not docs:
         raise RuntimeError(f"No .md files found in {kb_dir}.")
 
-    model = SentenceTransformer(model_name)
+    pc = Pinecone(api_key=api_key)
+    index = pc.Index(index_name)
 
-    client = chromadb.PersistentClient(path=str(persist_dir))
+    # Upsert as 'records' so Pinecone can embed the `text` field server-side.
+    records = []
+    for d in docs:
+        records.append(
+            {
+                "id": d.doc_id,
+                "text": d.text,
+                "metadata": {
+                    "title": d.title,
+                    "source": d.source,
+                    "url": d.url,
+                },
+            }
+        )
 
-    if rebuild:
-        try:
-            client.delete_collection(collection_name)
-        except Exception:
-            pass
+    for i in range(0, len(records), batch_size):
+        index.upsert(records=records[i : i + batch_size], namespace=namespace)
 
-    col = client.get_or_create_collection(name=collection_name)
-
-    texts = [d.text for d in docs]
-    embeddings = model.encode(texts, show_progress_bar=True).tolist()
-    ids = [d.doc_id for d in docs]
-    metadatas = [{"title": d.title, "source": d.source, "url": d.url} for d in docs]
-
-    # Prefer upsert if available; otherwise delete then add.
-    if hasattr(col, "upsert"):
-        col.upsert(ids=ids, documents=texts, embeddings=embeddings, metadatas=metadatas)
-    else:
-        try:
-            col.delete(ids=ids)
-        except Exception:
-            pass
-        col.add(ids=ids, documents=texts, embeddings=embeddings, metadatas=metadatas)
-
-    return len(docs)
+    return len(records)
 
 
 def main() -> None:
     repo_root = Path(__file__).resolve().parents[2]
     kb_dir = repo_root / "src" / "data" / "knowledge_base"
-    persist_dir = repo_root / "src" / "data" / "chroma"
 
-    n = ingest_markdown_kb(kb_dir=kb_dir, persist_dir=persist_dir, rebuild=True)
-    print(f"Ingested {n} chunks into Chroma at {persist_dir}")
+    index_name = os.environ.get("PINECONE_INDEX_NAME", "").strip()
+    namespace = os.environ.get("PINECONE_NAMESPACE", "finance_kb").strip() or "finance_kb"
+
+    if not index_name:
+        raise RuntimeError("PINECONE_INDEX_NAME is not set")
+
+    n = upsert_kb_to_pinecone(kb_dir=kb_dir, index_name=index_name, namespace=namespace)
+    print(f"Upserted {n} KB chunks into Pinecone index={index_name} namespace={namespace}")
 
 
 if __name__ == "__main__":
