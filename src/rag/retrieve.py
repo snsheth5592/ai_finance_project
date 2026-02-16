@@ -110,28 +110,31 @@ class ChromaRetriever:
             except Exception:
                 logger.exception("Chroma collection empty and auto-ingest failed")
 
+    def _safe_query(self, q_emb: list[float], top_k: int):
+        """Run a Chroma query and recover from stale collection handles."""
+        try:
+            return self.collection.query(
+                query_embeddings=[q_emb],
+                n_results=top_k,
+                include=["documents", "metadatas", "distances"],
+            )
+        except InvalidCollectionException:
+            logger.warning("Chroma collection handle is stale; recreating and retrying query")
+            self.client = chromadb.PersistentClient(path=str(self.persist_dir))
+            self.collection = self.client.get_or_create_collection(name=self.collection_name)
+            return self.collection.query(
+                query_embeddings=[q_emb],
+                n_results=top_k,
+                include=["documents", "metadatas", "distances"],
+            )
+
     def retrieve(self, query: str, top_k: int = 5) -> List[RetrievedChunk]:
         if not query.strip():
             return []
 
         q_emb = self.model.encode([query]).tolist()[0]
 
-        try:
-            res = self.collection.query(
-                query_embeddings=[q_emb],
-                n_results=top_k,
-                include=["documents", "metadatas", "distances"],
-            )
-        except InvalidCollectionException:
-            # In some deployments the collection handle can become stale (e.g., fresh Cloud FS / race).
-            logger.warning("Chroma collection handle was stale; recreating collection and retrying query")
-            self.client = chromadb.PersistentClient(path=str(self.persist_dir))
-            self.collection = self.client.get_or_create_collection(name=self.collection_name)
-            res = self.collection.query(
-                query_embeddings=[q_emb],
-                n_results=top_k,
-                include=["documents", "metadatas", "distances"],
-            )
+        res = self._safe_query(q_emb, top_k)
 
         docs = res.get("documents", [[]])[0] or []
 
@@ -171,22 +174,7 @@ class ChromaRetriever:
                     self.collection = self.client.get_or_create_collection(name=self.collection_name)
 
                     # retry the query once
-                    try:
-                        res = self.collection.query(
-                            query_embeddings=[q_emb],
-                            n_results=top_k,
-                            include=["documents", "metadatas", "distances"],
-                        )
-                    except InvalidCollectionException:
-                        logger.warning("Chroma collection stale after ingest; recreating handle and retrying")
-                        self.client = chromadb.PersistentClient(path=str(persist_dir2))
-                        self.collection = self.client.get_or_create_collection(name=self.collection_name)
-                        res = self.collection.query(
-                            query_embeddings=[q_emb],
-                            n_results=top_k,
-                            include=["documents", "metadatas", "distances"],
-                        )
-
+                    res = self._safe_query(q_emb, top_k)
                     docs = res.get("documents", [[]])[0] or []
                 except Exception:
                     logger.exception("Retry auto-ingest during retrieve failed")
