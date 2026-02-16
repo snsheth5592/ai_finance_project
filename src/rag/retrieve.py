@@ -7,6 +7,7 @@ from typing import List, Optional
 
 
 import chromadb
+from chromadb.errors import InvalidCollectionException
 from sentence_transformers import SentenceTransformer
 
 from src.utils.logging import get_logger
@@ -52,12 +53,28 @@ class ChromaRetriever:
             existing = 0
 
         if existing == 0:
-            try:
-                from src.rag.ingest import ingest_markdown_kb
+            repo_root = Path(__file__).resolve().parents[2]
+            kb_dir = repo_root / "src" / "data" / "knowledge_base"
+            persist_dir2 = repo_root / "src" / "data" / "chroma"
 
-                repo_root = Path(__file__).resolve().parents[2]
-                kb_dir = repo_root / "src" / "data" / "knowledge_base"
-                persist_dir2 = repo_root / "src" / "data" / "chroma"
+            logger.info(
+                "Chroma collection '%s' is empty. Attempting auto-ingest from kb_dir=%s into persist_dir=%s",
+                collection_name,
+                kb_dir,
+                persist_dir2,
+            )
+
+            try:
+                if kb_dir.exists():
+                    try:
+                        kb_files = sorted([p.name for p in kb_dir.glob("*.md")])
+                    except Exception:
+                        kb_files = []
+                    logger.info("KB markdown files found (%s): %s", len(kb_files), kb_files)
+                else:
+                    logger.warning("KB directory does not exist: %s", kb_dir)
+
+                from src.rag.ingest import ingest_markdown_kb
 
                 n = ingest_markdown_kb(
                     kb_dir=kb_dir,
@@ -65,18 +82,23 @@ class ChromaRetriever:
                     collection_name=collection_name,
                     rebuild=False,
                 )
-                logger.info(
-                    "Chroma collection was empty; ingested %s chunks from %s into %s",
-                    n,
-                    kb_dir,
-                    persist_dir2,
-                )
 
                 # Re-open collection after ingest
                 self.client = chromadb.PersistentClient(path=str(persist_dir2))
                 self.collection = self.client.get_or_create_collection(name=collection_name)
-            except Exception as e:
-                logger.warning("Chroma collection empty and auto-ingest failed: %s", e)
+
+                try:
+                    after = self.collection.count()  # type: ignore[attr-defined]
+                except Exception:
+                    after = None
+
+                logger.info(
+                    "Auto-ingest finished. Ingested=%s. Collection count after ingest=%s",
+                    n,
+                    after,
+                )
+            except Exception:
+                logger.exception("Chroma collection empty and auto-ingest failed")
 
     def retrieve(self, query: str, top_k: int = 5) -> List[RetrievedChunk]:
         if not query.strip():
@@ -84,13 +106,72 @@ class ChromaRetriever:
 
         q_emb = self.model.encode([query]).tolist()[0]
 
-        res = self.collection.query(
-            query_embeddings=[q_emb],
-            n_results=top_k,
-            include=["documents", "metadatas", "distances"],
-        )
+        try:
+            res = self.collection.query(
+                query_embeddings=[q_emb],
+                n_results=top_k,
+                include=["documents", "metadatas", "distances"],
+            )
+        except InvalidCollectionException:
+            # In some deployments the collection handle can become stale (e.g., fresh Cloud FS / race).
+            logger.warning("Chroma collection handle was stale; recreating collection and retrying query")
+            self.client = chromadb.PersistentClient(path=str(self.persist_dir))
+            self.collection = self.client.get_or_create_collection(name=self.collection_name)
+            res = self.collection.query(
+                query_embeddings=[q_emb],
+                n_results=top_k,
+                include=["documents", "metadatas", "distances"],
+            )
 
         docs = res.get("documents", [[]])[0] or []
+
+        # If nothing was retrieved, it's often because the collection is empty in a fresh deployment.
+        if not docs:
+            try:
+                cnt = self.collection.count()  # type: ignore[attr-defined]
+            except Exception:
+                cnt = 0
+
+            if cnt == 0:
+                try:
+                    repo_root = Path(__file__).resolve().parents[2]
+                    kb_dir = repo_root / "src" / "data" / "knowledge_base"
+                    persist_dir2 = repo_root / "src" / "data" / "chroma"
+                    from src.rag.ingest import ingest_markdown_kb
+
+                    logger.info("Retrieve got 0 docs and collection count=0. Retrying auto-ingest...")
+                    ingest_markdown_kb(
+                        kb_dir=kb_dir,
+                        persist_dir=persist_dir2,
+                        collection_name=self.collection_name,
+                        rebuild=False,
+                    )
+
+                    # Re-open collection after ingest (important on Cloud)
+                    self.persist_dir = persist_dir2
+                    self.client = chromadb.PersistentClient(path=str(persist_dir2))
+                    self.collection = self.client.get_or_create_collection(name=self.collection_name)
+
+                    # retry the query once
+                    try:
+                        res = self.collection.query(
+                            query_embeddings=[q_emb],
+                            n_results=top_k,
+                            include=["documents", "metadatas", "distances"],
+                        )
+                    except InvalidCollectionException:
+                        logger.warning("Chroma collection stale after ingest; recreating handle and retrying")
+                        self.client = chromadb.PersistentClient(path=str(persist_dir2))
+                        self.collection = self.client.get_or_create_collection(name=self.collection_name)
+                        res = self.collection.query(
+                            query_embeddings=[q_emb],
+                            n_results=top_k,
+                            include=["documents", "metadatas", "distances"],
+                        )
+
+                    docs = res.get("documents", [[]])[0] or []
+                except Exception:
+                    logger.exception("Retry auto-ingest during retrieve failed")
         metas = res.get("metadatas", [[]])[0] or []
         dists = res.get("distances", [[]])[0] or []
 
