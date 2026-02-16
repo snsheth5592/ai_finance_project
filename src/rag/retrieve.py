@@ -77,16 +77,18 @@ class InMemoryRetriever:
         texts: List[str] = []
         metas: List[dict] = []
         for f in files:
-            raw = InMemoryRetriever._read_markdown_file(f).strip()
-            if not raw:
+            raw = InMemoryRetriever._read_markdown_file(f)
+            if not raw.strip():
                 continue
-            title = f.stem.replace("_", " ")
-            for line in raw.splitlines()[:20]:
-                if line.strip().startswith("#"):
-                    title = line.strip().lstrip("#").strip() or title
-                    break
-            texts.append(raw)
-            metas.append({"title": title, "source": f.name, "url": None})
+
+            md_title, md_source, md_url, cleaned = PineconeRetriever._extract_md_metadata(raw)
+
+            title = (md_title or f.stem.replace("_", " ")).strip()
+            source_name = (md_source or "").strip() or f.name
+            url = (md_url or "").strip() or None
+
+            texts.append(cleaned)
+            metas.append({"title": title, "source": source_name, "url": url, "file": f.name})
         return texts, metas
 
     def retrieve(self, query: str, top_k: int = 5) -> List[RetrievedChunk]:
@@ -118,14 +120,61 @@ class InMemoryRetriever:
 class PineconeRetriever:
     """Pinecone-backed retriever for Streamlit Cloud stability.
 
-    Uses Pinecone integrated embeddings (text upsert + text query).
-    Automatically upserts the local markdown KB on first run if the namespace is empty.
+    Uses Pinecone integrated embeddings (text upsert + text search) compatible with
+    pinecone>=8.0.1.
 
     Env vars:
       - PINECONE_API_KEY
       - PINECONE_INDEX_NAME
       - PINECONE_NAMESPACE (optional, default: finance_kb)
     """
+
+    @staticmethod
+    def _extract_md_metadata(raw: str) -> Tuple[str, Optional[str], Optional[str], str]:
+        """Extract (title, source_name, url, cleaned_text) from a markdown doc.
+
+        Expected optional header lines near the top:
+          - Source: <publisher>
+          - URL: <https://...>
+
+        We remove those lines from the cleaned text so they don't pollute chunks.
+        """
+        lines = raw.splitlines()
+
+        # Title: first markdown heading, else filename-derived later
+        title: str = ""
+        source_name: Optional[str] = None
+        url: Optional[str] = None
+
+        cleaned: List[str] = []
+
+        # Only treat the first ~40 lines as metadata candidates
+        meta_scan_limit = min(len(lines), 40)
+
+        for idx, line in enumerate(lines):
+            s = line.strip()
+
+            if not title and s.startswith("#"):
+                title = s.lstrip("#").strip()
+                cleaned.append(line)
+                continue
+
+            if idx < meta_scan_limit:
+                if s.lower().startswith("source:"):
+                    val = s.split(":", 1)[1].strip()
+                    if val:
+                        source_name = val
+                    continue
+                if s.lower().startswith("url:"):
+                    val = s.split(":", 1)[1].strip()
+                    if val:
+                        url = val
+                    continue
+
+            cleaned.append(line)
+
+        cleaned_text = "\n".join(cleaned).strip()
+        return title, source_name, url, cleaned_text
 
     def __init__(
         self,
@@ -195,16 +244,16 @@ class PineconeRetriever:
             if not raw.strip():
                 continue
 
-            title = f.stem.replace("_", " ")
-            for line in raw.splitlines()[:20]:
-                if line.strip().startswith("#"):
-                    title = line.strip().lstrip("#").strip() or title
-                    break
+            md_title, md_source, md_url, cleaned = self._extract_md_metadata(raw)
 
-            for i, chunk in enumerate(self._chunk_text(raw)):
+            title = (md_title or f.stem.replace("_", " ")).strip()
+            source_name = (md_source or "").strip() or f.name
+            url = (md_url or "").strip() or None
+
+            for i, chunk in enumerate(self._chunk_text(cleaned)):
                 chunk_id = f"{f.name}::chunk_{i}"
                 texts.append(chunk)
-                metas.append({"title": title, "source": f.name, "url": None})
+                metas.append({"title": title, "source": source_name, "url": url, "file": f.name})
                 ids.append(chunk_id)
 
         return texts, metas, ids
@@ -235,45 +284,52 @@ class PineconeRetriever:
             records = []
             for j in range(i, min(i + batch, len(texts))):
                 md = dict(metas[j])
-                md["text"] = texts[j]
                 records.append(
                     {
-                        "id": ids[j],
+                        "_id": ids[j],
+                        # include both to be robust across field mappings
                         "text": texts[j],
-                        "metadata": md,
+                        "chunk_text": texts[j],
+                        # store fields flat (no nested metadata) for search(fields=...)
+                        "title": md.get("title"),
+                        "source": md.get("source"),
+                        "url": md.get("url"),
+                        "file": md.get("file"),
                     }
                 )
-            # record upsert lets Pinecone embed the `text` field server-side
-            self._index.upsert(records=records, namespace=self.namespace)
+            self._index.upsert_records(self.namespace, records)
 
     def retrieve(self, query: str, top_k: int = 5) -> List[RetrievedChunk]:
         if not query.strip():
             return []
 
-        res = self._index.query(
-            query={"text": query},
-            top_k=top_k,
-            include_metadata=True,
+        res = self._index.search(
             namespace=self.namespace,
+            query={
+                "inputs": {"text": query},
+                "top_k": top_k,
+            },
+            fields=["title", "source", "url", "file", "text", "chunk_text"],
         )
 
-        matches = (res or {}).get("matches", []) or []
+        hits = (((res or {}).get("result") or {}).get("hits") or [])
 
         out: List[RetrievedChunk] = []
-        for m in matches:
-            meta = (m or {}).get("metadata", {}) or {}
-            title = meta.get("title", "Unknown")
-            source = meta.get("source", "Unknown")
-            url = meta.get("url") or None
-            # Pinecone returns similarity score (higher is better). Convert to distance-like.
-            sim = float((m or {}).get("score", 0.0) or 0.0)
+        for h in hits:
+            fields = (h or {}).get("fields", {}) or {}
+            title = fields.get("title") or "Unknown"
+            source = fields.get("source") or "Unknown"
+            url = fields.get("url") or None
+            text = fields.get("chunk_text") or fields.get("text") or ""
+            score = float((h or {}).get("_score", 0.0) or 0.0)
+
             out.append(
                 RetrievedChunk(
-                    text=str(meta.get("text", "")) if meta.get("text") else "",  # optional if you store text
+                    text=str(text),
                     title=str(title),
                     source=str(source),
-                    url=url,
-                    score=float(1.0 - sim),
+                    url=str(url) if url else None,
+                    score=float(score),
                 )
             )
 

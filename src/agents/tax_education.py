@@ -1,5 +1,3 @@
-
-
 # src/agents/tax_education.py
 from __future__ import annotations
 
@@ -68,6 +66,18 @@ def _retrieve_context(query: str, top_k: int = 5) -> Tuple[str, List[Dict[str, A
     context_parts: List[str] = []
     sources: List[Dict[str, Any]] = []
 
+    def _clean_label(s: str) -> str:
+        s = (s or "").strip()
+        # If a filename slips through
+        if s.endswith(".md"):
+            s = s[:-3]
+        s = s.replace("_", " ").strip()
+        # Title-case, but preserve common domains-ish tokens
+        return s.title() if s else ""
+
+    def _is_summary(t: str) -> bool:
+        return (t or "").strip().lower() == "summary"
+
     def _chunk_get(chunk: Any, key: str, default: str = "") -> str:
         if chunk is None:
             return default
@@ -96,7 +106,42 @@ def _retrieve_context(query: str, top_k: int = 5) -> Tuple[str, List[Dict[str, A
             context_parts.append(f"{header}\n{text}" if header else text)
 
         if title or url or source:
-            sources.append({"title": title or "Reference", "source": source or "KB", "url": url or None})
+            pretty_source = _clean_label(source) or "KB"
+            pretty_title = _clean_label(title) or "Reference"
+
+            # If docs use "# Summary" headings, don't show that as the title.
+            if _is_summary(pretty_title):
+                pretty_title = pretty_source
+
+            # If title and source are the same, avoid redundant labels.
+            if pretty_title.strip().lower() == pretty_source.strip().lower():
+                pretty_title = pretty_source
+
+            sources.append(
+                {
+                    "title": pretty_title,
+                    "source": pretty_source,
+                    "url": url or None,
+                }
+            )
+
+    # Dedupe sources (title, source, url) and cap to 5
+    seen = set()
+    deduped: List[Dict[str, Any]] = []
+    for s in sources:
+        key = (
+            str(s.get("title", "")).strip().lower(),
+            str(s.get("source", "")).strip().lower(),
+            str(s.get("url", "") or "").strip().lower(),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(s)
+        if len(deduped) >= 5:
+            break
+
+    sources = deduped
 
     return "\n\n---\n\n".join(context_parts), sources
 

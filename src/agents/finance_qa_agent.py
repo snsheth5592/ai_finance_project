@@ -143,9 +143,25 @@ def _build_sources(chunks: List[RetrievedChunk]) -> List[Dict[str, str]]:
         if key in seen:
             continue
         seen.add(key)
-        d: Dict[str, str] = {"title": c.title, "source": c.source}
+        # Clean up source display (remove .md, underscores, etc.)
+        pretty_source = c.source or ""
+        if pretty_source.endswith(".md"):
+            pretty_source = pretty_source[:-3]
+        pretty_source = pretty_source.replace("_", " ").strip().title()
+
+        # Avoid redundant "Summary" titles coming from markdown headers
+        pretty_title = (c.title or "").strip()
+        if pretty_title.lower() == "summary":
+            pretty_title = pretty_source
+
+        d: Dict[str, str] = {
+            "title": pretty_title,
+            "source": pretty_source,
+        }
+
         if c.url:
             d["url"] = c.url
+
         sources.append(d)
     return sources
 

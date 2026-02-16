@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import List
 import os
 
 from pinecone import Pinecone
@@ -22,7 +22,7 @@ def chunk_text(text: str, chunk_size: int = 900, overlap: int = 150) -> List[str
     text = " ".join(text.split())
     if len(text) <= chunk_size:
         return [text]
-    chunks = []
+    chunks: List[str] = []
     start = 0
     while start < len(text):
         end = min(len(text), start + chunk_size)
@@ -79,13 +79,10 @@ def upsert_kb_to_pinecone(
 ) -> int:
     """Upsert markdown KB chunks into a Pinecone index using *integrated embeddings*.
 
-    This assumes your Pinecone index is configured with an integrated embedding model
-    (e.g., llama-text-embed-v2) and that the record field to embed is named `text`.
+    pinecone>=8 uses `upsert_records(namespace, records)` for text upserts.
 
-    Env var required:
+    Env vars required:
       - PINECONE_API_KEY
-
-    Returns number of chunks upserted.
     """
     api_key = os.environ.get("PINECONE_API_KEY", "").strip()
     if not api_key:
@@ -100,23 +97,23 @@ def upsert_kb_to_pinecone(
     pc = Pinecone(api_key=api_key)
     index = pc.Index(index_name)
 
-    # Upsert as 'records' so Pinecone can embed the `text` field server-side.
     records = []
     for d in docs:
+        # Integrated embedding records use `_id` + an embed-text field.
+        # Include both `text` and `chunk_text` to be robust across index field maps.
         records.append(
             {
-                "id": d.doc_id,
+                "_id": d.doc_id,
                 "text": d.text,
-                "metadata": {
-                    "title": d.title,
-                    "source": d.source,
-                    "url": d.url,
-                },
+                "chunk_text": d.text,
+                "title": d.title,
+                "source": d.source,
+                "url": d.url,
             }
         )
 
     for i in range(0, len(records), batch_size):
-        index.upsert(records=records[i : i + batch_size], namespace=namespace)
+        index.upsert_records(namespace, records[i : i + batch_size])
 
     return len(records)
 
