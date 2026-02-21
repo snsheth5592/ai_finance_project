@@ -40,7 +40,7 @@ class RouterRequest:
     portfolio_payload: Optional[Dict[str, Any]] = None
     resolved_symbol: Optional[str] = None
     chat_history: Optional[List[Dict[str, Any]]] = None
-# ---- Chat history helpers ----
+# ---- Chat history helpers (for LLM prompting only; do NOT use for retrieval queries) ----
 
 def _format_history_for_prompt(chat_history: Optional[List[Dict[str, Any]]], limit: int = 10) -> str:
     if not chat_history:
@@ -436,6 +436,46 @@ def _llm_plan_text(user_query: str) -> RouterPlan:
     # Deterministic short-circuit: portfolio payload cannot be inferred from plain text.
     q = (user_query or "").strip()
 
+    # Deterministic pre-routing for obvious intents (prevents LLM misclassification).
+    # Note: we keep chat history out of planning to avoid transcript pollution.
+    if _looks_like_tax_query(q):
+        return RouterPlan(
+            steps=(PlanStep(agent=AgentName.TAX_EDUCATION, query=q, symbol=None),),
+            synthesis_instructions=(
+                "Return a single tax-education answer. Include sources if available. "
+                "Do not provide personalized tax advice."
+            ),
+        )
+
+    if _looks_like_goal_planning_query(q):
+        return RouterPlan(
+            steps=(PlanStep(agent=AgentName.GOAL_PLANNING, query=q, symbol=None),),
+            synthesis_instructions=(
+                "Return a single goal-planning answer. Include sources if available. "
+                "Do not provide personalized financial advice."
+            ),
+        )
+
+    if _looks_like_market_query(q):
+        sym = _extract_symbol_from_text(q) or _company_alias_to_ticker(q)
+        return RouterPlan(
+            steps=(PlanStep(agent=AgentName.MARKET, query=q, symbol=sym),),
+            synthesis_instructions=(
+                "Return a single market-data answer. Preserve numeric fidelity. Include sources if available. "
+                "Do not provide personalized financial advice."
+            ),
+        )
+
+    if _looks_like_news_query(q):
+        sym = _extract_symbol_from_text(q) or _company_alias_to_ticker(q)
+        return RouterPlan(
+            steps=(PlanStep(agent=AgentName.NEWS, query=q, symbol=sym),),
+            synthesis_instructions=(
+                "Return a single news summary answer. Include sources when present. "
+                "Do not provide personalized financial advice."
+            ),
+        )
+
     llm = _get_router_llm()
 
     # Heuristic-only fallback if LLM unavailable.
@@ -463,7 +503,6 @@ def _llm_plan_text(user_query: str) -> RouterPlan:
         "{\"steps\":[{\"agent\":<agent>,\"query\":<string>,\"symbol\":<string|null>}],\"synthesis_instructions\":<string>}"
     )
 
-    hist = _format_history_for_prompt(None, limit=10)
     # If caller passed history via RouterRequest, it will be injected by run_graph nodes.
     prompt = f"User query: {q}"
 
@@ -519,10 +558,17 @@ def _llm_plan_text(user_query: str) -> RouterPlan:
     has_finance_qa = any(s.agent == AgentName.FINANCE_QA for s in steps)
 
     if has_market_or_news and not has_finance_qa and not _looks_like_pure_quote_query(q):
+        # Make the context step explicitly about interpreting stock performance/news,
+        # and forbid unrelated definitions (e.g., ETF explanations).
         steps.append(
             PlanStep(
                 agent=AgentName.FINANCE_QA,
-                query=f"Add brief context/caveats for interpreting the above, in an educational tone. Original user query: {q}",
+                query=(
+                    f"Provide brief educational context for interpreting stock performance and company news. "
+                    f"Explain how to interpret weekly price moves, percent vs dollar change, volatility, "
+                    f"and news catalysts. Do NOT define ETFs or unrelated products. "
+                    f"Original user query: {q}"
+                ),
                 symbol=None,
             )
         )
@@ -691,8 +737,7 @@ def _run_agent_safe(agent: AgentName, req: RouterRequest) -> Dict[str, Any]:
             from src.agents.finance_qa_agent import run_finance_qa_agent
 
             assert req.user_query is not None
-            q = _attach_history_to_query(req.user_query, req.chat_history)
-            return run_finance_qa_agent(q)
+            return run_finance_qa_agent(req.user_query)
 
         if agent == AgentName.PORTFOLIO:
             from src.agents.portfolio_agent import run_portfolio_agent
@@ -713,22 +758,19 @@ def _run_agent_safe(agent: AgentName, req: RouterRequest) -> Dict[str, Any]:
             from src.agents.goal_planning_agent import run_goal_planning_agent
 
             assert req.user_query is not None
-            q = _attach_history_to_query(req.user_query, req.chat_history)
-            return run_goal_planning_agent(q)
+            return run_goal_planning_agent(req.user_query)
 
         if agent == AgentName.NEWS:
             from src.agents.news_agent import run_news_agent
 
             assert req.user_query is not None
-            q = _attach_history_to_query(req.user_query, req.chat_history)
-            return run_news_agent(q)
+            return run_news_agent(req.user_query)
 
         if agent == AgentName.TAX_EDUCATION:
             from src.agents.tax_education import run_tax_education_agent
 
             assert req.user_query is not None
-            q = _attach_history_to_query(req.user_query, req.chat_history)
-            return run_tax_education_agent(q)
+            return run_tax_education_agent(req.user_query)
     except Exception as e:
         from src.agents.portfolio_agent import PortfolioValidationError
 
@@ -797,7 +839,7 @@ try:
 
         assert req.user_query is not None
         try:
-            plan = _llm_plan_text(_attach_history_to_query(req.user_query, req.chat_history))
+            plan = _llm_plan_text(req.user_query)
         except Exception as e:
             logger.warning("LLM plan failed, using single-agent fallback: %s", e)
             # Fallback: route to single agent via heuristics
@@ -830,25 +872,26 @@ try:
         if step.agent == AgentName.FINANCE_QA:
             from src.agents.finance_qa_agent import run_finance_qa_agent
 
-            return run_finance_qa_agent(_attach_history_to_query(step.query, req.chat_history))
+            return run_finance_qa_agent(step.query)
 
         if step.agent == AgentName.GOAL_PLANNING:
             from src.agents.goal_planning_agent import run_goal_planning_agent
 
-            return run_goal_planning_agent(_attach_history_to_query(step.query, req.chat_history))
+            return run_goal_planning_agent(step.query)
 
         if step.agent == AgentName.TAX_EDUCATION:
             from src.agents.tax_education import run_tax_education_agent
 
-            return run_tax_education_agent(_attach_history_to_query(step.query, req.chat_history))
+            return run_tax_education_agent(step.query)
 
         if step.agent == AgentName.NEWS:
             from src.agents.news_agent import run_news_agent
 
             q = step.query
             if step.symbol:
-                q = f"{step.symbol} {q}"
-            q = _attach_history_to_query(q, req.chat_history)
+                # Prefer clean symbol-first query for search quality
+                q = f"{step.symbol} latest news"
+            # Do NOT attach full conversation history to search query
             return run_news_agent(q)
 
         if step.agent == AgentName.MARKET:
@@ -912,6 +955,18 @@ try:
                 finance_out = out
             elif agent == "news":
                 news_out = out
+
+        # Relevance guard: if finance_qa answer looks unrelated to the user query,
+        # drop it to prevent generic ETF-style pollution.
+        if finance_out and req.user_query:
+            fq_text = (finance_out.get("answer") or finance_out.get("summary") or "").lower()
+            uq = req.user_query.lower()
+            # If finance text contains ETF/diversification but user asked about a specific company,
+            # treat it as irrelevant.
+            if any(k in fq_text for k in ["etf", "expense ratio", "diversification"]) and any(
+                name in uq for name in ["tesla", "apple", "amazon", "nvidia", "meta", "google"]
+            ):
+                finance_out = None
 
         # If both market and finance_qa ran, keep market answer EXACT and only append context.
         if market_out is not None and finance_out is not None:

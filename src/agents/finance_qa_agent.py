@@ -224,6 +224,31 @@ def _has_citations(text: str) -> bool:
     return bool(_CITATION_RE.search(text or ""))
 
 
+# Lightweight relevance guard to prevent unrelated ETF-style answers
+def _is_retrieval_relevant(user_query: str, retrieved: List[RetrievedChunk]) -> bool:
+    """
+    Basic keyword overlap guard.
+    If none of the top retrieved chunks share meaningful keywords
+    with the user query, treat retrieval as irrelevant.
+    """
+    if not retrieved:
+        return False
+
+    uq = user_query.lower()
+
+    # Extract simple keywords (alphanumeric tokens longer than 3 chars)
+    query_tokens = {t for t in re.findall(r"[a-zA-Z0-9]+", uq) if len(t) > 3}
+    if not query_tokens:
+        return True
+
+    combined_text = " ".join((c.title + " " + c.text).lower() for c in retrieved[:3])
+
+    overlap = sum(1 for t in query_tokens if t in combined_text)
+
+    # Require at least 1 meaningful overlapping token
+    return overlap > 0
+
+
 def _extractive_grounded_fallback(user_query: str, retrieved: List[RetrievedChunk]) -> str:
     """Fallback answer that is guaranteed grounded.
 
@@ -410,6 +435,25 @@ def compose_answer(
                 "No sufficient sources were retrieved to ground an answer.",
                 "For grounded answers, the knowledge base must return relevant sources.",
                 "Rephrase the question or expand the knowledge base.",
+            ],
+            definitions={},
+            sources=[],
+            disclaimer=DEFAULT_DISCLAIMER,
+            intent=intent.value,
+        )
+
+    # Relevance guard: prevent unrelated RAG pollution
+    if not _is_retrieval_relevant(user_query, retrieved):
+        logger.warning("RAG retrieved content not relevant to query; skipping finance_qa answer.")
+        return AgentResponse(
+            answer=(
+                "I don't have relevant sourced material in the knowledge base to answer that specific question.\n\n"
+                f"Question: {user_query}\n\n"
+                "Try a more general educational question, or expand the knowledge base with company-specific content."
+            ),
+            key_takeaways=[
+                "Retrieved sources did not match the query context.",
+                "Finance Q&A only answers when grounded in relevant material.",
             ],
             definitions={},
             sources=[],
