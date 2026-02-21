@@ -4,7 +4,7 @@ import json
 import re
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Tuple, Union, TypedDict, List
 
 from src.utils.logging import get_logger
 from src.core.llm_client import LLMClient, LLMConfig
@@ -30,6 +30,7 @@ class RouterRequest:
     - user_query: natural language question (routed to Finance Q&A or Market Analysis based on heuristics)
     - portfolio_payload: structured portfolio object for Portfolio Analysis agent
     - resolved_symbol: optional ticker symbol resolved from a company name (used for Market agent)
+    - chat_history: optional list of prior messages for context (for multi-turn chat)
 
     The router is intentionally conservative: it routes to a single agent for MVP.
     """
@@ -37,12 +38,52 @@ class RouterRequest:
     user_query: Optional[str] = None
     portfolio_payload: Optional[Dict[str, Any]] = None
     resolved_symbol: Optional[str] = None
+    chat_history: Optional[List[Dict[str, Any]]] = None
+# ---- Chat history helpers ----
+
+def _format_history_for_prompt(chat_history: Optional[List[Dict[str, Any]]], limit: int = 10) -> str:
+    if not chat_history:
+        return ""
+    tail = chat_history[-limit:]
+    lines: list[str] = []
+    for m in tail:
+        role = str(m.get("role") or "").strip().lower()
+        content = str(m.get("content") or "").strip()
+        if not content:
+            continue
+        if role == "assistant":
+            lines.append(f"Assistant: {content}")
+        else:
+            lines.append(f"User: {content}")
+    return "\n".join(lines).strip()
+
+
+def _attach_history_to_query(user_query: str, chat_history: Optional[List[Dict[str, Any]]], limit: int = 10) -> str:
+    hist = _format_history_for_prompt(chat_history, limit=limit)
+    if not hist:
+        return user_query
+    # Keep it simple and consistent for agent prompts.
+    return f"Conversation so far (most recent last):\n{hist}\n\nCurrent user question: {user_query}"
 
 
 @dataclass(frozen=True)
 class RouterResult:
     agent: AgentName
     output: Dict[str, Any]
+
+
+# ---- Multi-agent planning dataclasses ----
+@dataclass(frozen=True)
+class PlanStep:
+    agent: AgentName
+    query: str
+    symbol: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class RouterPlan:
+    steps: Tuple[PlanStep, ...]
+    synthesis_instructions: str
 
 
 class RouterError(ValueError):
@@ -231,6 +272,15 @@ def _looks_like_market_query(text: str) -> bool:
     return any(k in q for k in keywords)
 
 
+def _looks_like_pure_quote_query(text: str) -> bool:
+    """True if user seems to want only a quote/price with no explanation."""
+    q = (text or "").lower()
+    # If they ask "what is" / "explain" / "why" then they want context.
+    if any(k in q for k in ["what is", "explain", "why", "how", "should i", "risk"]):
+        return False
+    # Quote-like intents
+    return any(k in q for k in ["price", "quote", "chart", "performance", "today", "this week", "this month"]) and len(q.split()) <= 10
+
 def _looks_like_goal_planning_query(text: str) -> bool:
     """Heuristic to decide if a query is about goal setting / planning.
 
@@ -376,6 +426,114 @@ def _looks_like_tax_query(text: str) -> bool:
     return tax_hits and not market_exclusions
 
 
+def _llm_plan_text(user_query: str) -> RouterPlan:
+    """LLM planner that can select multiple agents.
+
+    Returns a plan with up to 3 steps.
+    """
+
+    # Deterministic short-circuit: portfolio payload cannot be inferred from plain text.
+    q = (user_query or "").strip()
+
+    llm = _get_router_llm()
+
+    # Heuristic-only fallback if LLM unavailable.
+    if llm is None:
+        agent, sym = _llm_route_text(q)
+        return RouterPlan(
+            steps=(PlanStep(agent=agent, query=q, symbol=sym),),
+            synthesis_instructions="Return a single helpful answer. Include sources if available. Do not provide personalized financial advice.",
+        )
+
+    system = (
+        "You are a planner for an AI Finance Assistant. "
+        "You may choose ONE OR MORE agents to answer a user query. "
+        "Agents: finance_qa, market, goal_planning, news, tax_education, portfolio. "
+        "Rules: "
+        "- portfolio agent ONLY if the user provides structured holdings/portfolio payload. Otherwise do not select it. "
+        "- market agent ONLY for price/performance/quote/chart requests about a public security. "
+        "- news agent for financial news/headlines; it can be combined with market. "
+        "- tax_education for taxes/accounts; it can be combined with goal_planning or finance_qa. "
+        "- finance_qa for definitions/education; use it to add context/caveats. "
+        "- goal_planning for saving/budget/timeline/retirement planning. "
+        "- Output at most 3 steps. "
+        "- For market/news steps, include a ticker in 'symbol' if you can (e.g., Apple -> AAPL, Tesla -> TSLA). Use null if unknown. "
+        "Output ONLY valid JSON with this schema: "
+        "{\"steps\":[{\"agent\":<agent>,\"query\":<string>,\"symbol\":<string|null>}],\"synthesis_instructions\":<string>}"
+    )
+
+    hist = _format_history_for_prompt(None, limit=10)
+    # If caller passed history via RouterRequest, it will be injected by run_graph nodes.
+    prompt = f"User query: {q}"
+
+    text = llm.generate(system_prompt=system, user_prompt=prompt)
+    data = _safe_json_loads(str(text).strip()) or {}
+
+    steps_raw = data.get("steps")
+    if not isinstance(steps_raw, list) or not steps_raw:
+        # Fallback to single-agent
+        agent, sym = _llm_route_text(q)
+        return RouterPlan(
+            steps=(PlanStep(agent=agent, query=q, symbol=sym),),
+            synthesis_instructions="Return a single helpful answer. Include sources if available. Do not provide personalized financial advice.",
+        )
+
+    steps: list[PlanStep] = []
+    for item in steps_raw[:3]:
+        if not isinstance(item, dict):
+            continue
+        agent_raw = str(item.get("agent", "")).strip().lower()
+        query = str(item.get("query", "") or q).strip() or q
+        sym_raw = item.get("symbol")
+        symbol = str(sym_raw).strip().upper() if isinstance(sym_raw, str) and sym_raw.strip() else None
+
+        # Map to AgentName
+        if agent_raw == "market":
+            agent = AgentName.MARKET
+        elif agent_raw == "news":
+            agent = AgentName.NEWS
+        elif agent_raw == "goal_planning":
+            agent = AgentName.GOAL_PLANNING
+        elif agent_raw == "tax_education":
+            agent = AgentName.TAX_EDUCATION
+        elif agent_raw == "portfolio":
+            # Disallow portfolio in text-only planning
+            continue
+        else:
+            agent = AgentName.FINANCE_QA
+
+        # Deterministic ticker fallback for market/news if missing
+        if agent in (AgentName.MARKET, AgentName.NEWS) and not symbol:
+            symbol = _extract_symbol_from_text(q) or _company_alias_to_ticker(q)
+
+        steps.append(PlanStep(agent=agent, query=query, symbol=symbol))
+
+    if not steps:
+        agent, sym = _llm_route_text(q)
+        steps = [PlanStep(agent=agent, query=q, symbol=sym)]
+
+    # Deterministic post-processing: if Market/News is selected, add Finance Q&A context/caveats
+    # unless the query appears to be a pure quote request.
+    has_market_or_news = any(s.agent in (AgentName.MARKET, AgentName.NEWS) for s in steps)
+    has_finance_qa = any(s.agent == AgentName.FINANCE_QA for s in steps)
+
+    if has_market_or_news and not has_finance_qa and not _looks_like_pure_quote_query(q):
+        steps.append(
+            PlanStep(
+                agent=AgentName.FINANCE_QA,
+                query=f"Add brief context/caveats for interpreting the above, in an educational tone. Original user query: {q}",
+                symbol=None,
+            )
+        )
+        steps = steps[:3]
+
+    synth = str(data.get("synthesis_instructions") or "").strip()
+    if not synth:
+        synth = "Combine the agent results into one concise answer. Include sources when present. Do not provide personalized financial advice."
+
+    return RouterPlan(steps=tuple(steps), synthesis_instructions=synth)
+
+
 def _llm_route_text(user_query: str) -> Tuple[AgentName, Optional[str]]:
     """LLM router for text. Returns (agent, resolved_symbol)."""
     # Deterministic pre-routing to reduce LLM mistakes.
@@ -500,22 +658,27 @@ def normalize_request(raw: Union[str, Dict[str, Any], RouterRequest]) -> RouterR
     raise RouterError(f"Unsupported input type: {type(raw)}")
 
 
-def route(req: RouterRequest) -> AgentName:
-    """Route a normalized request to a single agent."""
+def route(req: RouterRequest) -> Tuple[AgentName, RouterRequest]:
+    """Route a normalized request to a single agent and return updated request."""
     if req.portfolio_payload is not None and req.user_query is not None:
         raise RouterError("Provide only one of user_query or portfolio_payload, not both.")
 
     if req.portfolio_payload is not None:
-        return AgentName.PORTFOLIO
+        return AgentName.PORTFOLIO, req
 
     if req.user_query is not None:
         agent, symbol = _llm_route_text(req.user_query)
         # Deterministic fallback for company-name to ticker if LLM didn't provide one.
         if agent == AgentName.MARKET and not symbol:
             symbol = _extract_symbol_from_text(req.user_query) or _company_alias_to_ticker(req.user_query)
-        # Attach resolved symbol onto the request for downstream use.
-        object.__setattr__(req, "resolved_symbol", symbol)
-        return agent
+
+        updated = RouterRequest(
+            user_query=req.user_query,
+            portfolio_payload=None,
+            resolved_symbol=symbol,
+            chat_history=req.chat_history,
+        )
+        return agent, updated
 
     raise RouterError("No user_query or portfolio_payload provided.")
 
@@ -530,7 +693,7 @@ def run(raw: Union[str, Dict[str, Any], RouterRequest]) -> RouterResult:
     - Market agent: expects a string query about a ticker/market data
     """
     req = normalize_request(raw)
-    agent = route(req)
+    agent, req = route(req)
 
     logger.info(
         "Router selected agent=%s user_query=%s portfolio_payload=%s",
@@ -543,7 +706,8 @@ def run(raw: Union[str, Dict[str, Any], RouterRequest]) -> RouterResult:
         from src.agents.finance_qa_agent import run_finance_qa_agent
 
         assert req.user_query is not None
-        output = run_finance_qa_agent(req.user_query)
+        q = _attach_history_to_query(req.user_query, req.chat_history)
+        output = run_finance_qa_agent(q)
         return RouterResult(agent=agent, output=output)
 
     if agent == AgentName.PORTFOLIO:
@@ -568,22 +732,266 @@ def run(raw: Union[str, Dict[str, Any], RouterRequest]) -> RouterResult:
         from src.agents.goal_planning_agent import run_goal_planning_agent
 
         assert req.user_query is not None
-        output = run_goal_planning_agent(req.user_query)
+        q = _attach_history_to_query(req.user_query, req.chat_history)
+        output = run_goal_planning_agent(q)
         return RouterResult(agent=agent, output=output)
 
     if agent == AgentName.NEWS:
         from src.agents.news_agent import run_news_agent
 
         assert req.user_query is not None
-        output = run_news_agent(req.user_query)
+        q = _attach_history_to_query(req.user_query, req.chat_history)
+        output = run_news_agent(q)
         return RouterResult(agent=agent, output=output)
 
     if agent == AgentName.TAX_EDUCATION:
         from src.agents.tax_education import run_tax_education_agent
 
         assert req.user_query is not None
-        output = run_tax_education_agent(req.user_query)
+        q = _attach_history_to_query(req.user_query, req.chat_history)
+        output = run_tax_education_agent(q)
         return RouterResult(agent=agent, output=output)
 
     # Defensive (should be unreachable)
     raise RouterError(f"Unsupported agent selected: {agent}")
+
+# -----------------------------
+# LangGraph orchestration (MVP)
+# -----------------------------
+
+try:
+    from langgraph.graph import END, StateGraph
+
+    class RouterState(TypedDict, total=False):
+        raw: Union[str, Dict[str, Any], RouterRequest]
+        req: RouterRequest
+        plan: RouterPlan
+        step_index: int
+        step_results: list[dict]
+        output: Dict[str, Any]
+
+    _GRAPH = None
+
+    def _node_normalize(state: RouterState) -> RouterState:
+        req = normalize_request(state["raw"])
+        return {"req": req}
+
+    def _node_plan(state: RouterState) -> RouterState:
+        req = state["req"]
+        if req.portfolio_payload is not None:
+            # Portfolio payload is deterministic single-step
+            plan = RouterPlan(
+                steps=(PlanStep(agent=AgentName.PORTFOLIO, query="", symbol=None),),
+                synthesis_instructions="Return the portfolio analysis output.",
+            )
+            return {"plan": plan, "step_index": 0, "step_results": []}
+
+        assert req.user_query is not None
+        plan = _llm_plan_text(_attach_history_to_query(req.user_query, req.chat_history))
+        return {"plan": plan, "step_index": 0, "step_results": []}
+
+    def _run_one_step(req: RouterRequest, step: PlanStep) -> dict:
+        # Dispatch per step
+        if step.agent == AgentName.FINANCE_QA:
+            from src.agents.finance_qa_agent import run_finance_qa_agent
+
+            return run_finance_qa_agent(_attach_history_to_query(step.query, req.chat_history))
+
+        if step.agent == AgentName.GOAL_PLANNING:
+            from src.agents.goal_planning_agent import run_goal_planning_agent
+
+            return run_goal_planning_agent(_attach_history_to_query(step.query, req.chat_history))
+
+        if step.agent == AgentName.TAX_EDUCATION:
+            from src.agents.tax_education import run_tax_education_agent
+
+            return run_tax_education_agent(_attach_history_to_query(step.query, req.chat_history))
+
+        if step.agent == AgentName.NEWS:
+            from src.agents.news_agent import run_news_agent
+
+            q = step.query
+            if step.symbol:
+                q = f"{step.symbol} {q}"
+            q = _attach_history_to_query(q, req.chat_history)
+            return run_news_agent(q)
+
+        if step.agent == AgentName.MARKET:
+            from src.agents.market_analysis_agent import run_market_analysis_agent
+
+            q = step.query
+            if step.symbol:
+                q = f"{step.symbol} {q}"
+            return run_market_analysis_agent(q)
+
+        if step.agent == AgentName.PORTFOLIO:
+            from src.agents.portfolio_agent import run_portfolio_agent
+
+            assert req.portfolio_payload is not None
+            return run_portfolio_agent(req.portfolio_payload)
+
+        raise RouterError(f"Unsupported agent selected: {step.agent}")
+
+    def _node_execute_step(state: RouterState) -> RouterState:
+        req = state["req"]
+        plan = state["plan"]
+        idx = int(state.get("step_index", 0))
+        results = list(state.get("step_results") or [])
+
+        if idx >= len(plan.steps):
+            return {"step_index": idx, "step_results": results}
+
+        step = plan.steps[idx]
+        out = _run_one_step(req, step)
+
+        results.append(
+            {
+                "agent": step.agent.value,
+                "query": step.query,
+                "symbol": step.symbol,
+                "output": out,
+            }
+        )
+
+        return {"step_index": idx + 1, "step_results": results}
+
+    def _node_synthesize(state: RouterState) -> RouterState:
+        req = state["req"]
+        plan = state["plan"]
+        results = list(state.get("step_results") or [])
+
+        # Deterministic synthesis for common multi-agent flows to preserve numeric fidelity.
+        def _get_text(o: dict) -> str:
+            return str(o.get("answer") or o.get("summary") or o.get("analysis") or "").strip()
+
+        market_out = None
+        finance_out = None
+        news_out = None
+
+        for r in results:
+            agent = (r.get("agent") or "").strip()
+            out = r.get("output") or {}
+            if agent == "market":
+                market_out = out
+            elif agent == "finance_qa":
+                finance_out = out
+            elif agent == "news":
+                news_out = out
+
+        # If both market and finance_qa ran, keep market answer EXACT and only append context.
+        if market_out is not None and finance_out is not None:
+            pieces = []
+            market_text = _get_text(market_out)
+            if market_text:
+                pieces.append(market_text)
+
+            if news_out is not None:
+                news_text = _get_text(news_out)
+                if news_text:
+                    pieces.append("\n\nNews context:\n" + news_text)
+
+            finance_text = _get_text(finance_out)
+            if finance_text:
+                pieces.append("\n\nContext / how to interpret:\n" + finance_text)
+
+            final = "\n".join(pieces).strip()
+            routed_agents = [r.get("agent") for r in results if r.get("agent")]
+            return {"output": {"answer": final, "results": results, "routed_agents": routed_agents}}
+
+        # If only one step, just pass through as final.
+        if len(results) == 1:
+            routed_agents = [r.get("agent") for r in results if r.get("agent")]
+            return {"output": {"answer": results[0]["output"].get("answer") or results[0]["output"].get("summary") or "", "results": results, "routed_agents": routed_agents}}
+
+        # LLM synthesize best-effort
+        llm = _get_router_llm()
+        if llm is None:
+            # Deterministic fallback
+            parts = []
+            for r in results:
+                o = r.get("output") or {}
+                txt = o.get("answer") or o.get("summary") or o.get("analysis") or ""
+                if txt:
+                    parts.append(f"[{r.get('agent')}]: {txt}")
+            final = "\n\n".join(parts).strip()
+            routed_agents = [r.get("agent") for r in results if r.get("agent")]
+            return {"output": {"answer": final, "results": results, "routed_agents": routed_agents}}
+
+        system = (
+            "You are a finance assistant synthesizer. "
+            "Combine multiple agent outputs into one coherent response. "
+            "Rules: "
+            "- DO NOT use markdown emphasis (no **, *, _, backticks). Plain text only. "
+            "- DO NOT reformat numeric values; if market output contains prices/percents, copy them exactly. "
+            "- Do not claim data is missing if an agent provided it. "
+            "- Keep it concise, avoid repetition, and include citations/sources when present. "
+            "- Do not provide personalized financial advice; keep it educational. "
+            f"Synthesis instructions: {plan.synthesis_instructions}"
+        )
+
+        user = {
+            "user_query": req.user_query,
+            "results": results,
+        }
+
+        text = llm.generate(system_prompt=system, user_prompt=json.dumps(user))
+        final = str(text).strip()
+        routed_agents = [r.get("agent") for r in results if r.get("agent")]
+        return {"output": {"answer": final, "results": results, "routed_agents": routed_agents}}
+
+    def _should_continue(state: RouterState) -> str:
+        plan = state["plan"]
+        idx = int(state.get("step_index", 0))
+        return "execute" if idx < len(plan.steps) else "synthesize"
+
+    def get_graph():
+        global _GRAPH
+        if _GRAPH is not None:
+            return _GRAPH
+
+        g = StateGraph(RouterState)
+        g.add_node("normalize", _node_normalize)
+        g.add_node("plan", _node_plan)
+        g.add_node("execute", _node_execute_step)
+        g.add_node("synthesize", _node_synthesize)
+
+        g.set_entry_point("normalize")
+        g.add_edge("normalize", "plan")
+        g.add_edge("plan", "execute")
+        g.add_conditional_edges("execute", _should_continue, {"execute": "execute", "synthesize": "synthesize"})
+        g.add_edge("synthesize", END)
+
+        _GRAPH = g.compile()
+        logger.info("LangGraph router graph compiled")
+        return _GRAPH
+
+    def run_graph(raw: Union[str, Dict[str, Any], RouterRequest]) -> RouterResult:
+        """LangGraph entry point.
+
+        Returns the same RouterResult as `run()` so Streamlit can switch without refactors.
+        """
+        graph = get_graph()
+        out = graph.invoke({"raw": raw})
+        output = out.get("output")
+        if not isinstance(output, dict):
+            raise RouterError(f"LangGraph returned invalid output: {out}")
+
+        # For compatibility, set the top-level agent to the first routed agent when available.
+        routed_agents = output.get("routed_agents")
+        if isinstance(routed_agents, list) and routed_agents:
+            first = str(routed_agents[0])
+            try:
+                agent = AgentName(first)
+            except Exception:
+                agent = AgentName.FINANCE_QA
+        else:
+            plan = out.get("plan")
+            agent = AgentName.FINANCE_QA
+            if isinstance(plan, RouterPlan) and plan.steps:
+                agent = plan.steps[0].agent
+
+        return RouterResult(agent=agent, output=output)
+
+except Exception as _e:
+    # LangGraph is optional for local dev; fall back to existing router.
+    logger.warning("LangGraph unavailable; run_graph() will not be provided. err=%s", _e)

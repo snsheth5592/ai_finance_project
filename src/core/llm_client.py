@@ -12,9 +12,12 @@ from src.utils.logging import get_logger
 logger = get_logger(__name__)
 
 try:
-    from openai import OpenAI
+    from langchain_openai import ChatOpenAI
+    from langchain_core.messages import HumanMessage, SystemMessage
 except Exception as e:  # pragma: no cover
-    OpenAI = None  # type: ignore
+    ChatOpenAI = None  # type: ignore
+    HumanMessage = None  # type: ignore
+    SystemMessage = None  # type: ignore
     _IMPORT_ERR = e
 else:
     _IMPORT_ERR = None
@@ -43,10 +46,10 @@ class LLMClient:
     """
 
     def __init__(self, config: LLMConfig) -> None:
-        if _IMPORT_ERR is not None or OpenAI is None:
+        if _IMPORT_ERR is not None or ChatOpenAI is None:
             raise LLMClientError(
-                "OpenAI SDK not installed or failed to import. "
-                "Add `openai` to requirements.txt and reinstall."
+                "langchain-openai not installed or failed to import. "
+                "Add `langchain-openai` and `langchain-core` to requirements.txt and reinstall."
             ) from _IMPORT_ERR
 
         api_key = os.getenv("OPENAI_API_KEY")
@@ -57,7 +60,13 @@ class LLMClient:
             )
 
         self.config = config
-        self.client = OpenAI(api_key=api_key, timeout=self.config.request_timeout_s)
+        # ChatOpenAI reads OPENAI_API_KEY from env; we still validate it above.
+        self.client = ChatOpenAI(
+            model=self.config.model,
+            temperature=self.config.temperature,
+            max_tokens=self.config.max_output_tokens,
+            timeout=self.config.request_timeout_s,
+        )
 
     def _is_retryable_error(self, e: Exception) -> bool:
         name = e.__class__.__name__
@@ -89,14 +98,21 @@ class LLMClient:
         return backoff + jitter
 
     def _extract_usage(self, resp) -> Tuple[Optional[int], Optional[int], Optional[int]]:
+        """Best-effort token usage extraction across providers.
+
+        LangChain message objects sometimes carry usage in `response_metadata`.
+        """
         try:
-            usage = getattr(resp, "usage", None)
-            if not usage:
-                return (None, None, None)
-            prompt = getattr(usage, "prompt_tokens", None)
-            completion = getattr(usage, "completion_tokens", None)
-            total = getattr(usage, "total_tokens", None)
-            return (prompt, completion, total)
+            meta = getattr(resp, "response_metadata", None) or {}
+            usage = meta.get("token_usage") or meta.get("usage") or {}
+            prompt = usage.get("prompt_tokens")
+            completion = usage.get("completion_tokens")
+            total = usage.get("total_tokens")
+            return (
+                int(prompt) if prompt is not None else None,
+                int(completion) if completion is not None else None,
+                int(total) if total is not None else None,
+            )
         except Exception:
             return (None, None, None)
 
@@ -107,32 +123,29 @@ class LLMClient:
         user_prompt: str,
         context: Optional[str] = None,
     ) -> str:
-        messages = [{"role": "system", "content": system_prompt}]
+        if SystemMessage is None or HumanMessage is None:
+            raise LLMClientError("langchain-core messages unavailable; check dependencies")
+
+        messages = [SystemMessage(content=system_prompt)]
 
         if context and context.strip():
             messages.append(
-                {
-                    "role": "system",
-                    "content": (
+                SystemMessage(
+                    content=(
                         "Reference material (use this for grounding; do not invent facts beyond it):\n\n"
                         f"{context.strip()}"
-                    ),
-                }
+                    )
+                )
             )
 
-        messages.append({"role": "user", "content": user_prompt})
+        messages.append(HumanMessage(content=user_prompt))
 
         start = time.monotonic()
         last_err: Optional[Exception] = None
 
         for attempt in range(self.config.max_retries + 1):
             try:
-                resp = self.client.chat.completions.create(
-                    model=self.config.model,
-                    messages=messages,
-                    temperature=self.config.temperature,
-                    max_tokens=self.config.max_output_tokens,
-                )
+                resp = self.client.invoke(messages)
 
                 elapsed_ms = (time.monotonic() - start) * 1000.0
                 in_tok, out_tok, total_tok = self._extract_usage(resp)
@@ -146,7 +159,7 @@ class LLMClient:
                     total_tok,
                 )
 
-                text = (resp.choices[0].message.content or "").strip()
+                text = (getattr(resp, "content", None) or "").strip()
                 return text
 
             except Exception as e:

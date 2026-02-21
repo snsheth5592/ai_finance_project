@@ -1,5 +1,9 @@
 # Finance AI Project Dependencies
 
+langchain>=1.2.0
+langchain-core>=1.2.0
+langchain-openai>=0.2.0
+langgraph>=1.0.0
 openai==2.21.0
 pinecone==8.0.1
 streamlit>=1.54.0

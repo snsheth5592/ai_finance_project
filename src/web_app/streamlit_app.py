@@ -13,6 +13,8 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+CHAT_HISTORY_PATH = REPO_ROOT / "src" / "data" / "chat_history.json"
+
 import os
 
 # Load .env before other imports (OpenAI, etc. need OPENAI_API_KEY)
@@ -26,7 +28,14 @@ from streamlit_autorefresh import st_autorefresh
 
 from src.core.config import load_settings
 from src.utils.logging import setup_logging
-from src.workflow.router import RouterError, run as run_router, AgentName
+# Prefer LangGraph router if available
+from src.workflow.router import RouterError, run as run_router, AgentName, RouterRequest
+
+# Prefer LangGraph router if available
+try:
+    from src.workflow.router import run_graph as run_router_graph
+except Exception:
+    run_router_graph = None  # type: ignore
 
 # ------------------- Lazy agent loaders (avoid import-time crashes on Streamlit Cloud) -------------------
 
@@ -65,6 +74,98 @@ def _run_tax_education_agent(user_query: str) -> Dict[str, Any]:
 
     return run_tax_education_agent(user_query)
 
+
+# ------------------- Shared chat history (ALL tabs) -------------------
+
+def _load_chat_history_from_disk() -> list[dict[str, str]]:
+    try:
+        if CHAT_HISTORY_PATH.exists():
+            raw = CHAT_HISTORY_PATH.read_text(encoding="utf-8")
+            data = json.loads(raw)
+            if isinstance(data, list):
+                out: list[dict[str, str]] = []
+                for m in data:
+                    if not isinstance(m, dict):
+                        continue
+                    role = str(m.get("role") or "").strip().lower()
+                    content = str(m.get("content") or "").strip()
+                    if role in ("user", "assistant") and content:
+                        out.append({"role": role, "content": content})
+                return out
+    except Exception:
+        pass
+    return []
+
+
+def _save_chat_history_to_disk(msgs: list[dict[str, str]]) -> None:
+    try:
+        CHAT_HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+        # keep last 200 messages to avoid unbounded growth
+        trimmed = (msgs or [])[-200:]
+        CHAT_HISTORY_PATH.write_text(json.dumps(trimmed, indent=2), encoding="utf-8")
+    except Exception:
+        # best-effort persistence; ignore failures
+        pass
+
+
+if "chat_messages" not in st.session_state:
+    st.session_state.chat_messages = _load_chat_history_from_disk()  # list[{role:'user'|'assistant', content:str}]
+
+
+def append_chat(role: str, content: str) -> None:
+    content = (content or "").strip()
+    if not content:
+        return
+    role = (role or "").strip().lower()
+    if role not in ("user", "assistant"):
+        role = "user"
+    st.session_state.chat_messages.append({"role": role, "content": content})
+    _save_chat_history_to_disk(list(st.session_state.chat_messages))
+
+
+def last_chat(limit: int = 10) -> list[dict[str, str]]:
+    msgs = list(st.session_state.get("chat_messages") or [])
+    return msgs[-limit:]
+
+
+def _build_turns(msgs: list[dict[str, str]]) -> list[dict[str, str]]:
+    turns: list[dict[str, str]] = []
+    cur_user = ""
+    cur_assistant = ""
+    for m in msgs:
+        role = (m.get("role") or "").lower()
+        content = str(m.get("content") or "").strip()
+        if not content:
+            continue
+        if role == "user":
+            if cur_user or cur_assistant:
+                turns.append({"user": cur_user, "assistant": cur_assistant})
+                cur_user, cur_assistant = "", ""
+            cur_user = content
+        elif role == "assistant":
+            cur_assistant = content
+            turns.append({"user": cur_user, "assistant": cur_assistant})
+            cur_user, cur_assistant = "", ""
+    if cur_user or cur_assistant:
+        turns.append({"user": cur_user, "assistant": cur_assistant})
+    return turns
+
+
+def render_conversation(limit_turns: int = 25) -> None:
+    turns = _build_turns(list(st.session_state.get("chat_messages") or []))
+    turns = list(reversed(turns))[:limit_turns]
+    if not turns:
+        st.caption("No messages yet.")
+        return
+    for t in turns:
+        u = (t.get("user") or "").strip()
+        a = (t.get("assistant") or "").strip()
+        if u:
+            with st.chat_message("user"):
+                st.markdown(u)
+        if a:
+            with st.chat_message("assistant"):
+                st.markdown(a)
 
 def render_sources(sources: list[dict[str, str]]) -> None:
     if not sources:
@@ -544,6 +645,19 @@ if clean_headlines:
 else:
     st.caption("Top finance headlines: unavailable.")
 
+
+# ------------------- Clear conversation button helper -------------------
+
+def render_clear_conversation_button(key_suffix: str) -> None:
+    col_clear, col_hint = st.columns([1, 4])
+    with col_clear:
+        if st.button("Clear conversation", key=f"clear_chat_{key_suffix}"):
+            st.session_state.chat_messages = []
+            _save_chat_history_to_disk([])
+            st.rerun()
+    with col_hint:
+        st.caption("Conversation persists across restarts (stored locally as JSON).")
+
 # Load config + logging and show errors in UI
 try:
     config_path = REPO_ROOT / "config.yaml"
@@ -561,152 +675,184 @@ auto_tab, qa_tab, portfolio_tab, market_tab, goal_tab, news_tab, tax_tab = st.ta
 
 with auto_tab:
     st.subheader("Auto")
-    st.caption("Single entry point: ask a question or paste a portfolio JSON. The router will pick the right agent.")
+    st.caption("Chat-style entry point: ask a question or paste a portfolio JSON. The router will pick the right agent(s).")
 
-    example_portfolio = {
-        "holdings": [
-            {"symbol": "VOO", "asset_type": "etf", "value_usd": 12000.0, "expense_ratio": 0.0003},
-            {"symbol": "BND", "asset_type": "etf", "value_usd": 3000.0, "expense_ratio": 0.0003},
-            {"symbol": "AAPL", "asset_type": "stock", "value_usd": 2500.0},
-        ],
-        "cash_usd": 500.0,
-        "account_type": "taxable",
-    }
+    # Ensure running flag exists
+    if "auto_running" not in st.session_state:
+        st.session_state.auto_running = False
 
-    if "auto_input" not in st.session_state:
-        st.session_state.auto_input = "What is an ETF?"
-
-    st.markdown("**Input** (either a question *or* a portfolio JSON payload)")
-    auto_text = st.text_area(
-        "Input",
-        value=st.session_state.auto_input,
-        height=220,
-        placeholder="Type a question like: What is an ETF?\n\nOr paste JSON like:\n" + json.dumps(example_portfolio, indent=2),
-        label_visibility="collapsed",
+    # Chat input at the top (right under tab header)
+    user_msg = st.chat_input(
+        "Ask anything finance-related, or paste a portfolio JSON payload…",
+        disabled=bool(st.session_state.get("auto_running")),
     )
 
-    col_a, col_b = st.columns([1, 2])
-    with col_a:
-        run_auto = st.button("Run")
-    with col_b:
-        st.caption("Tip: If you paste JSON, it must include a 'holdings' list.")
-
-    if run_auto:
-        st.session_state.auto_input = auto_text
-
-        raw = auto_text.strip()
+    if user_msg:
+        raw = (user_msg or "").strip()
         if not raw:
-            st.warning("Enter a question or paste a portfolio JSON.")
             st.stop()
 
-        # Auto-detect JSON vs plain text.
+        # Append user message
+        append_chat("user", raw)
+
+        # Auto-detect JSON vs plain text
         parsed: Any
         if raw.startswith("{"):
             try:
                 parsed = json.loads(raw)
             except Exception:
-                parsed = raw  # treat as plain text if JSON parsing fails
+                parsed = raw
         else:
             parsed = raw
 
+        st.session_state.auto_running = True
         try:
-            routed = run_router(parsed)
+            with st.spinner("Running..."):
+                if run_router_graph is not None:
+                    if isinstance(parsed, str):
+                        routed = run_router_graph(RouterRequest(user_query=parsed, chat_history=last_chat(10)))
+                    else:
+                        routed = run_router_graph(parsed)
+                else:
+                    if isinstance(parsed, str):
+                        routed = run_router(RouterRequest(user_query=parsed, chat_history=last_chat(10)))
+                    else:
+                        routed = run_router(parsed)
         except RouterError as e:
+            st.session_state.auto_running = False
+            append_chat("assistant", f"Router could not route this input. {str(e)}")
             st.error("Router could not route this input.")
             st.caption(str(e))
             st.stop()
         except Exception as e:
+            st.session_state.auto_running = False
+            append_chat("assistant", "Router crashed.")
             st.error("Router crashed.")
             st.exception(e)
             st.stop()
+        finally:
+            st.session_state.auto_running = False
 
-        st.success(f"Routed to: {routed.agent.value}")
+        # Build a single assistant message (avoid double-render; history renderer will display it)
+        routed_agents = []
+        try:
+            routed_agents = list((routed.output or {}).get("routed_agents") or [])
+        except Exception:
+            routed_agents = []
 
-        # Render based on selected agent
-        if routed.agent == AgentName.FINANCE_QA:
-            st.subheader("Answer")
-            st.markdown(routed.output.get("answer", ""))
+        step_results = []
+        try:
+            step_results = list((routed.output or {}).get("results") or [])
+        except Exception:
+            step_results = []
 
-            if routed.output.get("key_takeaways"):
-                st.subheader("Key takeaways")
-                for t in routed.output["key_takeaways"]:
-                    st.markdown(f"- {t}")
+        routed_line = ""
+        if routed_agents:
+            routed_line = "Routed to: " + " → ".join([str(a) for a in routed_agents])
+        else:
+            routed_line = f"Routed to: {routed.agent.value}"
 
-            if routed.output.get("definitions"):
-                st.subheader("Definitions")
-                for k, v in routed.output["definitions"].items():
-                    st.markdown(f"- **{k}**: {v}")
+        # Multi-step (LangGraph) response
+        if step_results:
+            assistant_text = str((routed.output or {}).get("answer", "") or "").strip()
+            disclaimer = str((routed.output or {}).get("disclaimer", "") or "").strip()
+            if disclaimer:
+                assistant_text = assistant_text + "\n\n" + disclaimer
+            # Store debug for optional inspection
+            st.session_state["auto_last_debug"] = {
+                "routed_agents": routed_agents,
+                "results": step_results,
+                "sources": (routed.output or {}).get("sources", []),
+                "disclaimer": (routed.output or {}).get("disclaimer", ""),
+            }
+        else:
+            # Single-agent
+            if routed.agent == AgentName.FINANCE_QA:
+                assistant_text = str(routed.output.get("answer", "") or "").strip()
+                disclaimer = str(routed.output.get("disclaimer", "") or "").strip()
+                if disclaimer:
+                    assistant_text = assistant_text + "\n\n" + disclaimer
+                st.session_state["auto_last_debug"] = {"agent": routed.agent.value, "output": routed.output}
+            elif routed.agent == AgentName.PORTFOLIO:
+                assistant_text = str(routed.output.get("summary", "") or "").strip()
+                st.session_state["auto_last_debug"] = {"agent": routed.agent.value, "output": routed.output}
+            elif routed.agent == AgentName.MARKET:
+                assistant_text = str(routed.output.get("answer", "") or "").strip()
+                disclaimer = str(routed.output.get("disclaimer", "") or "").strip()
+                if disclaimer:
+                    assistant_text = assistant_text + "\n\n" + disclaimer
+                st.session_state["auto_last_debug"] = {"agent": routed.agent.value, "output": routed.output}
+            elif routed.agent == AgentName.GOAL_PLANNING:
+                assistant_text = str(routed.output.get("answer", "") or "").strip()
+                disclaimer = str(routed.output.get("disclaimer", "") or "").strip()
+                if disclaimer:
+                    assistant_text = assistant_text + "\n\n" + disclaimer
+                st.session_state["auto_last_debug"] = {"agent": routed.agent.value, "output": routed.output}
+            elif routed.agent == AgentName.NEWS:
+                assistant_text = str(routed.output.get("answer", "") or "").strip()
+                disclaimer = str(routed.output.get("disclaimer", "") or "").strip()
+                if disclaimer:
+                    assistant_text = assistant_text + "\n\n" + disclaimer
+                st.session_state["auto_last_debug"] = {"agent": routed.agent.value, "output": routed.output}
+            elif routed.agent == AgentName.TAX_EDUCATION:
+                assistant_text = str(routed.output.get("answer", "") or "").strip()
+                disclaimer = str(routed.output.get("disclaimer", "") or "").strip()
+                if disclaimer:
+                    assistant_text = assistant_text + "\n\n" + disclaimer
+                st.session_state["auto_last_debug"] = {"agent": routed.agent.value, "output": routed.output}
+            else:
+                assistant_text = str((routed.output or {}).get("answer", "") or "").strip()
+                st.session_state["auto_last_debug"] = {"agent": routed.agent.value, "output": routed.output}
 
-            st.subheader("Sources")
-            render_sources(routed.output.get("sources", []))
-            st.caption(routed.output.get("disclaimer", ""))
+        full_assistant_text = (routed_line + "\n\n" + (assistant_text or "")).strip()
+        if full_assistant_text:
+            append_chat("assistant", full_assistant_text)
+        else:
+            append_chat("assistant", routed_line)
 
-        elif routed.agent == AgentName.PORTFOLIO:
-            render_portfolio_result(routed.output)
+        # Rerun so the history renderer shows the new turn exactly once
+        st.rerun()
 
-        elif routed.agent == AgentName.MARKET:
-            render_market_result(routed.output)
-
-        elif routed.agent == AgentName.GOAL_PLANNING:
-            render_goal_planning_result(routed.output)
-
-        elif routed.agent == AgentName.NEWS:
-            render_news_result(routed.output)
-
-        elif routed.agent == AgentName.TAX_EDUCATION:
-            render_tax_result(routed.output)
-
-        with st.expander("Debug (raw JSON)"):
-            st.code(json.dumps({"agent": routed.agent.value, "output": routed.output}, indent=2), language="json")
+    if not user_msg:
+        render_clear_conversation_button("auto")
+        st.divider()
+        render_conversation(limit_turns=25)
 
 with qa_tab:
     st.subheader("Finance Q&A")
 
-    if "qa_messages" not in st.session_state:
-        st.session_state.qa_messages = []
+    if "qa_query" not in st.session_state:
+        st.session_state.qa_query = ""
 
-    # Render history
-    for m in st.session_state.qa_messages:
-        with st.chat_message(m["role"]):
-            st.markdown(m["content"])
+    qa_query = st.text_input(
+        "Ask a finance question (e.g., 'What is an ETF?')",
+        value=st.session_state.qa_query,
+        key="qa_query_input",
+    )
 
-    # Chat input
-    user_query = st.chat_input("Ask a finance question (e.g., 'What is an ETF?')")
+    run_qa = st.button("Ask", key="qa_run")
 
-    if user_query:
-        st.session_state.qa_messages.append({"role": "user", "content": user_query})
-        with st.chat_message("user"):
-            st.markdown(user_query)
-
+    if run_qa:
+        st.session_state.qa_query = qa_query
+        q = (qa_query or "").strip()
+        if not q:
+            st.warning("Enter a question.")
+            st.stop()
+        append_chat("user", q)
         try:
-            result: Dict[str, Any] = _run_finance_qa_agent(user_query, rag_top_k=settings.rag_top_k)
+            result: Dict[str, Any] = _run_finance_qa_agent(q, rag_top_k=settings.rag_top_k)
         except Exception as e:
             st.error("Agent crashed while answering.")
             st.exception(e)
+            append_chat("assistant", "(Finance Q&A crashed.)")
             st.stop()
+        ans = str(result.get("answer", "") or "").strip()
+        append_chat("assistant", ans or "(No answer returned.)")
+        st.rerun()
 
-        with st.chat_message("assistant"):
-            st.markdown(result["answer"])
-
-            if result.get("key_takeaways"):
-                st.subheader("Key takeaways")
-                for t in result["key_takeaways"]:
-                    st.markdown(f"- {t}")
-
-            if result.get("definitions"):
-                st.subheader("Definitions")
-                for k, v in result["definitions"].items():
-                    st.markdown(f"- **{k}**: {v}")
-
-            st.subheader("Sources")
-            render_sources(result.get("sources", []))
-
-            st.caption(result.get("disclaimer", ""))
-
-            with st.expander("Debug (raw JSON)"):
-                st.code(json.dumps(result, indent=2), language="json")
-
-        st.session_state.qa_messages.append({"role": "assistant", "content": result["answer"]})
+    render_clear_conversation_button("qa")
+    st.divider()
+    render_conversation(limit_turns=25)
 
 with portfolio_tab:
     st.subheader("Portfolio Analysis")
@@ -746,19 +892,23 @@ with portfolio_tab:
             st.error("Invalid JSON. Fix formatting and try again.")
             st.exception(e)
             st.stop()
-
+        append_chat("user", "[Portfolio] Analyze portfolio")
         try:
             result: Dict[str, Any] = _run_portfolio_agent(payload)
         except Exception as e:
             st.error("Portfolio agent crashed while analyzing.")
             st.exception(e)
+            append_chat("assistant", "[Portfolio] (Portfolio agent crashed.)")
             st.stop()
-
+        append_chat("assistant", f"[Portfolio] {result.get('summary','')}")
         st.success("Analysis complete")
         render_portfolio_result(result)
-
         with st.expander("Debug (raw JSON)"):
             st.code(json.dumps(result, indent=2), language="json")
+
+    render_clear_conversation_button("portfolio")
+    st.divider()
+    render_conversation(limit_turns=25)
 
 with market_tab:
     st.subheader("Market Analysis")
@@ -780,21 +930,24 @@ with market_tab:
         if not q:
             st.warning("Enter a ticker question.")
             st.stop()
-
+        append_chat("user", f"[Market] {q}")
         try:
             result: Dict[str, Any] = _run_market_analysis_agent(q)
         except Exception as e:
             st.error("Market agent crashed.")
             st.exception(e)
+            append_chat("assistant", "[Market] (Market agent crashed.)")
             st.stop()
-
+        append_chat("assistant", f"[Market] {result.get('answer','')}")
         render_market_result(result)
-
         with st.expander("Debug (raw JSON)"):
             st.code(json.dumps(result, indent=2), language="json")
 
+    render_clear_conversation_button("market")
+    st.divider()
+    render_conversation(limit_turns=25)
 
-# ------------------- Goal Planning Tab -------------------
+
 with goal_tab:
     st.subheader("Goal Planning")
     st.caption("Set a savings goal and get a practical plan (monthly target, checklist, and follow-ups).")
@@ -815,21 +968,24 @@ with goal_tab:
         if not q:
             st.warning("Enter a goal description.")
             st.stop()
-
+        append_chat("user", f"[Goal] {q}")
         try:
             result: Dict[str, Any] = _run_goal_planning_agent(q)
         except Exception as e:
             st.error("Goal planning agent crashed.")
             st.exception(e)
+            append_chat("assistant", "[Goal] (Goal planning agent crashed.)")
             st.stop()
-
+        append_chat("assistant", f"[Goal] {result.get('answer','')}")
         render_goal_planning_result(result)
-
         with st.expander("Debug (raw JSON)"):
             st.code(json.dumps(result, indent=2), language="json")
 
+    render_clear_conversation_button("goal")
+    st.divider()
+    render_conversation(limit_turns=25)
 
-# ------------------- News Tab -------------------
+
 with news_tab:
     st.subheader("News")
     st.caption("Summarize and contextualize financial news using Yahoo Finance headlines + Tavily web search (if configured).")
@@ -850,21 +1006,24 @@ with news_tab:
         if not q:
             st.warning("Enter a news query.")
             st.stop()
-
+        append_chat("user", f"[News] {q}")
         try:
             result: Dict[str, Any] = _run_news_agent(q)
         except Exception as e:
             st.error("News agent crashed.")
             st.exception(e)
+            append_chat("assistant", "[News] (News agent crashed.)")
             st.stop()
-
+        append_chat("assistant", f"[News] {result.get('answer','')}")
         render_news_result(result)
-
         with st.expander("Debug (raw JSON)"):
             st.code(json.dumps(result, indent=2), language="json")
 
+    render_clear_conversation_button("news")
+    st.divider()
+    render_conversation(limit_turns=25)
 
-# ------------------- Tax Tab -------------------
+
 with tax_tab:
     st.subheader("Tax Education")
     st.caption("Explain tax concepts and account types (education only).")
@@ -885,15 +1044,19 @@ with tax_tab:
         if not q:
             st.warning("Enter a tax question.")
             st.stop()
-
+        append_chat("user", f"[Tax] {q}")
         try:
             result: Dict[str, Any] = _run_tax_education_agent(q)
         except Exception as e:
             st.error("Tax agent crashed.")
             st.exception(e)
+            append_chat("assistant", "[Tax] (Tax agent crashed.)")
             st.stop()
-
+        append_chat("assistant", f"[Tax] {result.get('answer','')}")
         render_tax_result(result)
-
         with st.expander("Debug (raw JSON)"):
             st.code(json.dumps(result, indent=2), language="json")
+
+    render_clear_conversation_button("tax")
+    st.divider()
+    render_conversation(limit_turns=25)

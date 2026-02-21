@@ -404,17 +404,20 @@ def fetch_quote_and_daily(symbol: str) -> Tuple[Quote, List[DailyBar]]:
         as_of=as_of,
     )
 
-    # Daily bars: get 6 months of daily data (enough for 1M+ range)
-    df_hist = _yf_history(symbol, period="6mo", interval="1d")
+    # Daily bars: try 6mo first; if empty (common on Cloud), fall back to shorter periods.
     bars: List[DailyBar] = []
-    if df_hist is not None and not getattr(df_hist, "empty", True):
-        df_hist = df_hist.dropna()
-        for idx, row in df_hist.iterrows():
+
+    def _to_bars(df) -> List[DailyBar]:
+        out: List[DailyBar] = []
+        if df is None or getattr(df, "empty", True):
+            return out
+        df = df.dropna()
+        for idx, row in df.iterrows():
             try:
                 date = str(getattr(idx, "date", lambda: idx)()) if hasattr(idx, "date") else str(idx)
                 if len(date) >= 10:
                     date = date[:10]
-                bars.append(
+                out.append(
                     DailyBar(
                         date=date,
                         open=_safe_float(row.get("Open")),
@@ -426,9 +429,15 @@ def fetch_quote_and_daily(symbol: str) -> Tuple[Quote, List[DailyBar]]:
                 )
             except Exception:
                 continue
+        out.sort(key=lambda b: b.date, reverse=True)
+        return out
 
-        # Most recent first
-        bars.sort(key=lambda b: b.date, reverse=True)
+    # Try progressively smaller windows until we get some bars.
+    for period in ("6mo", "3mo", "1mo", "5d"):
+        df_hist = _yf_history(symbol, period=period, interval="1d")
+        bars = _to_bars(df_hist)
+        if bars:
+            break
 
     return quote, bars
 
@@ -529,7 +538,7 @@ def run_market_analysis_agent(user_query: str) -> Dict[str, Any]:
     try:
         quote, bars = fetch_quote_and_daily(symbol)
         if not bars:
-            warnings.append("Daily history unavailable; showing quote-only view.")
+            warnings.append("Daily history unavailable from Yahoo at the moment; showing quote-only view.")
         summary = compute_market_summary(symbol, quote, bars)
     except MarketDataError as e:
         return {
