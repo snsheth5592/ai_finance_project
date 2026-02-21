@@ -100,6 +100,20 @@ TAVILY_API_KEY=optional
 streamlit run src/web_app/streamlit_app.py
 ```
 
+## Testing
+
+```bash
+pytest
+```
+
+With coverage (excludes Streamlit UI for practical reasons):
+
+```bash
+pytest --cov=src --cov-report=term-missing
+```
+
+Current coverage: ~58% of core logic (agents, router, RAG, config). Streamlit app is omitted from coverage.
+
 ---
 
 # 3. API Documentation

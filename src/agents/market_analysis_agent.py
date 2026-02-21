@@ -548,6 +548,15 @@ def run_market_analysis_agent(user_query: str) -> Dict[str, Any]:
             "disclaimer": "Educational information only — not financial, tax, or legal advice.",
             "sources": sources,
         }
+    except Exception as e:
+        logger.exception("Market agent unexpected error for %s: %s", symbol, e)
+        return {
+            "intent": intent,
+            "symbol": symbol,
+            "answer": f"Could not fetch market data for {symbol}. Please try again later.",
+            "disclaimer": "Educational information only — not financial, tax, or legal advice.",
+            "sources": sources,
+        }
 
     q = summary["quote"]
     changes = summary["horizon_changes"]

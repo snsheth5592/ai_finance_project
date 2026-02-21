@@ -156,3 +156,33 @@ class TestChatHistoryPersistence:
             assert len(last_10) == 10
             assert last_10[0]["content"] == "user_msg_10"
             assert last_10[-1]["content"] == "assistant_msg_14"
+
+
+class TestBuildTurns:
+    """Tests for _build_turns (converts flat messages to user/assistant pairs)."""
+
+    def test_build_turns(self) -> None:
+        from src.web_app import streamlit_app
+
+        msgs = [
+            {"role": "user", "content": "q1"},
+            {"role": "assistant", "content": "a1"},
+            {"role": "user", "content": "q2"},
+            {"role": "assistant", "content": "a2"},
+        ]
+        turns = streamlit_app._build_turns(msgs)
+        assert len(turns) == 2
+        assert turns[0] == {"user": "q1", "assistant": "a1"}
+        assert turns[1] == {"user": "q2", "assistant": "a2"}
+
+    def test_build_turns_trailing_user(self) -> None:
+        from src.web_app import streamlit_app
+
+        msgs = [
+            {"role": "user", "content": "q1"},
+            {"role": "assistant", "content": "a1"},
+            {"role": "user", "content": "q2"},
+        ]
+        turns = streamlit_app._build_turns(msgs)
+        assert len(turns) == 2
+        assert turns[1] == {"user": "q2", "assistant": ""}

@@ -427,9 +427,9 @@ def compose_answer(
             logger.warning("LLM answer had no [S#] citations; falling back to extractive grounded answer.")
             answer = _extractive_grounded_fallback(user_query, retrieved)
 
-    except LLMClientError:
+    except Exception:
         logger.info("DEBUG: using fallback simple answer")
-        # If LLM fails, still answer based on top chunk
+        # If LLM fails (missing key, timeout, etc.), still answer based on top chunk
         answer = _extractive_grounded_fallback(user_query, retrieved)
 
     # Minimal definitions to improve beginner clarity (expand later)

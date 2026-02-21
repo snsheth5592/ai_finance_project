@@ -3,7 +3,11 @@
 
 from __future__ import annotations
 
+from unittest.mock import patch
+
 import pytest
+
+from src.rag.retrieve import RetrievedChunk
 
 from src.agents.finance_qa_agent import (
     classify_intent,
@@ -42,6 +46,26 @@ class TestFinanceQAAgent:
         assert "sources" in result
         assert "disclaimer" in result
         assert len(result["answer"]) > 0
+
+    @patch("src.agents.finance_qa_agent.retrieve_context")
+    @patch("src.agents.finance_qa_agent._get_llm")
+    def test_run_finance_qa_agent_mocked(
+        self, mock_llm: object, mock_retrieve: object
+    ) -> None:
+        mock_retrieve.return_value = [
+            RetrievedChunk(
+                text="An ETF is an exchange-traded fund.",
+                source="etf.md",
+                title="ETFs",
+                url="https://example.com",
+                score=0.9,
+            ),
+        ]
+        mock_llm.return_value.generate.return_value = "An ETF is a fund that trades like a stock."
+        result = run_finance_qa_agent("What is an ETF?")
+        assert isinstance(result, dict)
+        assert "answer" in result
+        assert "key_takeaways" in result
 
 
 class TestPortfolioAgent:

@@ -9,9 +9,33 @@ import pytest
 
 from src.rag.retrieve import (
     InMemoryRetriever,
+    PineconeRetriever,
     RetrievedChunk,
     default_retriever,
 )
+
+
+class TestInMemoryRetrieverHelpers:
+    """Tests for InMemoryRetriever static helpers."""
+
+    def test_tokenize(self) -> None:
+        tokens = InMemoryRetriever._tokenize("Hello World 123")
+        assert "hello" in tokens
+        assert "world" in tokens
+        assert "123" in tokens
+
+    def test_tf(self) -> None:
+        c = InMemoryRetriever._tf("a b a c")
+        assert c["a"] == 2
+        assert c["b"] == 1
+
+    def test_cosine_counts(self) -> None:
+        from collections import Counter
+
+        a = Counter(["a", "b", "a"])
+        b = Counter(["a", "b", "c"])
+        sim = InMemoryRetriever._cosine_counts(a, b)
+        assert 0 <= sim <= 1
 
 
 class TestInMemoryRetriever:
@@ -62,3 +86,29 @@ class TestDefaultRetriever:
         assert isinstance(chunks, list)
         for c in chunks:
             assert isinstance(c, RetrievedChunk)
+
+
+class TestPineconeRetrieverExtractMd:
+    """Tests for PineconeRetriever._extract_md_metadata (static)."""
+
+    def test_extract_title_and_source(self) -> None:
+        raw = """# My Title
+
+Source: Test Source
+URL: https://example.com
+
+Content here.
+"""
+        title, source, url, cleaned = PineconeRetriever._extract_md_metadata(raw)
+        assert title == "My Title"
+        assert source == "Test Source"
+        assert url == "https://example.com"
+        assert "Content here" in cleaned
+
+    def test_extract_minimal(self) -> None:
+        raw = "Just content, no metadata."
+        title, source, url, cleaned = PineconeRetriever._extract_md_metadata(raw)
+        assert title == ""
+        assert source is None
+        assert url is None
+        assert cleaned == "Just content, no metadata."

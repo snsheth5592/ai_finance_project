@@ -414,16 +414,20 @@ def fetch_ticker_tape(tickers: list[str]) -> pd.DataFrame:
 
     Uses daily bars (period=2d) so it works consistently outside market hours.
     Cached for 5 minutes to avoid repeated downloads on Streamlit reruns.
+    Returns empty DataFrame on network/API failure.
     """
-    df = yf.download(
-        tickers=" ".join(tickers),
-        period="2d",
-        interval="1d",
-        group_by="ticker",
-        auto_adjust=False,
-        progress=False,
-        threads=False,
-    )
+    try:
+        df = yf.download(
+            tickers=" ".join(tickers),
+            period="2d",
+            interval="1d",
+            group_by="ticker",
+            auto_adjust=False,
+            progress=False,
+            threads=False,
+        )
+    except Exception:
+        return pd.DataFrame([{"ticker": t, "price": None, "chg": None, "chg_pct": None} for t in tickers])
 
     rows: list[dict[str, Any]] = []
 
@@ -624,11 +628,17 @@ st_autorefresh(interval=300_000, key="ticker_tape_refresh")
 
 with st.container():
     st.caption("Top tickers (updates every ~5 minutes)")
-    tape_df = fetch_ticker_tape(TOP10_TICKERS)
-    render_ticker_tape(tape_df)
+    try:
+        tape_df = fetch_ticker_tape(TOP10_TICKERS)
+        render_ticker_tape(tape_df)
+    except Exception:
+        st.caption("Ticker tape temporarily unavailable.")
 
 # Top 3 finance news (titles only)
-headlines = fetch_top_finance_headlines(limit=3)
+try:
+    headlines = fetch_top_finance_headlines(limit=3)
+except Exception:
+    headlines = []
 
 # Filter out empty titles defensively
 clean_headlines = [h for h in (headlines or []) if str(h.get("title") or "").strip()]

@@ -8,6 +8,7 @@ from typing import Any, Dict, Optional, Tuple, Union, TypedDict, List
 
 from src.utils.logging import get_logger
 from src.core.llm_client import LLMClient, LLMConfig
+from src.core.errors import safe_agent_output
 
 logger = get_logger(__name__)
 
@@ -683,14 +684,72 @@ def route(req: RouterRequest) -> Tuple[AgentName, RouterRequest]:
     raise RouterError("No user_query or portfolio_payload provided.")
 
 
+def _run_agent_safe(agent: AgentName, req: RouterRequest) -> Dict[str, Any]:
+    """Run the appropriate agent with error handling. Returns output dict or fallback on error."""
+    try:
+        if agent == AgentName.FINANCE_QA:
+            from src.agents.finance_qa_agent import run_finance_qa_agent
+
+            assert req.user_query is not None
+            q = _attach_history_to_query(req.user_query, req.chat_history)
+            return run_finance_qa_agent(q)
+
+        if agent == AgentName.PORTFOLIO:
+            from src.agents.portfolio_agent import run_portfolio_agent
+
+            assert req.portfolio_payload is not None
+            return run_portfolio_agent(req.portfolio_payload)
+
+        if agent == AgentName.MARKET:
+            from src.agents.market_analysis_agent import run_market_analysis_agent
+
+            assert req.user_query is not None
+            query = req.user_query
+            if req.resolved_symbol:
+                query = f"{req.resolved_symbol} {req.user_query}"
+            return run_market_analysis_agent(query)
+
+        if agent == AgentName.GOAL_PLANNING:
+            from src.agents.goal_planning_agent import run_goal_planning_agent
+
+            assert req.user_query is not None
+            q = _attach_history_to_query(req.user_query, req.chat_history)
+            return run_goal_planning_agent(q)
+
+        if agent == AgentName.NEWS:
+            from src.agents.news_agent import run_news_agent
+
+            assert req.user_query is not None
+            q = _attach_history_to_query(req.user_query, req.chat_history)
+            return run_news_agent(q)
+
+        if agent == AgentName.TAX_EDUCATION:
+            from src.agents.tax_education import run_tax_education_agent
+
+            assert req.user_query is not None
+            q = _attach_history_to_query(req.user_query, req.chat_history)
+            return run_tax_education_agent(q)
+    except Exception as e:
+        from src.agents.portfolio_agent import PortfolioValidationError
+
+        if isinstance(e, PortfolioValidationError):
+            return {
+                "summary": f"Portfolio validation error: {e}",
+                "answer": f"Please fix your portfolio input: {e}",
+                "disclaimer": "Educational information only — not financial, tax, or legal advice.",
+                "sources": [],
+            }
+        logger.exception("Agent %s failed: %s", agent.value, e)
+        return safe_agent_output(agent.value, e)
+
+    raise RouterError(f"Unsupported agent selected: {agent}")
+
+
 def run(raw: Union[str, Dict[str, Any], RouterRequest]) -> RouterResult:
     """End-to-end router execution.
 
     For MVP, routes to a single agent and returns its output.
-
-    - Finance Q&A agent: expects a string query
-    - Portfolio agent: expects a dict portfolio payload
-    - Market agent: expects a string query about a ticker/market data
+    Wraps agent calls in error handling; returns fallback output on failure.
     """
     req = normalize_request(raw)
     agent, req = route(req)
@@ -702,58 +761,8 @@ def run(raw: Union[str, Dict[str, Any], RouterRequest]) -> RouterResult:
         bool(req.portfolio_payload),
     )
 
-    if agent == AgentName.FINANCE_QA:
-        from src.agents.finance_qa_agent import run_finance_qa_agent
-
-        assert req.user_query is not None
-        q = _attach_history_to_query(req.user_query, req.chat_history)
-        output = run_finance_qa_agent(q)
-        return RouterResult(agent=agent, output=output)
-
-    if agent == AgentName.PORTFOLIO:
-        from src.agents.portfolio_agent import run_portfolio_agent
-
-        assert req.portfolio_payload is not None
-        output = run_portfolio_agent(req.portfolio_payload)
-        return RouterResult(agent=agent, output=output)
-
-    if agent == AgentName.MARKET:
-        from src.agents.market_analysis_agent import run_market_analysis_agent
-
-        assert req.user_query is not None
-        query = req.user_query
-        if req.resolved_symbol:
-            # Rewrite query to include ticker so the market agent extractor works reliably.
-            query = f"{req.resolved_symbol} {req.user_query}"
-        output = run_market_analysis_agent(query)
-        return RouterResult(agent=agent, output=output)
-
-    if agent == AgentName.GOAL_PLANNING:
-        from src.agents.goal_planning_agent import run_goal_planning_agent
-
-        assert req.user_query is not None
-        q = _attach_history_to_query(req.user_query, req.chat_history)
-        output = run_goal_planning_agent(q)
-        return RouterResult(agent=agent, output=output)
-
-    if agent == AgentName.NEWS:
-        from src.agents.news_agent import run_news_agent
-
-        assert req.user_query is not None
-        q = _attach_history_to_query(req.user_query, req.chat_history)
-        output = run_news_agent(q)
-        return RouterResult(agent=agent, output=output)
-
-    if agent == AgentName.TAX_EDUCATION:
-        from src.agents.tax_education import run_tax_education_agent
-
-        assert req.user_query is not None
-        q = _attach_history_to_query(req.user_query, req.chat_history)
-        output = run_tax_education_agent(q)
-        return RouterResult(agent=agent, output=output)
-
-    # Defensive (should be unreachable)
-    raise RouterError(f"Unsupported agent selected: {agent}")
+    output = _run_agent_safe(agent, req)
+    return RouterResult(agent=agent, output=output)
 
 # -----------------------------
 # LangGraph orchestration (MVP)
@@ -787,10 +796,36 @@ try:
             return {"plan": plan, "step_index": 0, "step_results": []}
 
         assert req.user_query is not None
-        plan = _llm_plan_text(_attach_history_to_query(req.user_query, req.chat_history))
+        try:
+            plan = _llm_plan_text(_attach_history_to_query(req.user_query, req.chat_history))
+        except Exception as e:
+            logger.warning("LLM plan failed, using single-agent fallback: %s", e)
+            # Fallback: route to single agent via heuristics
+            agent, sym = _llm_route_text(req.user_query)
+            plan = RouterPlan(
+                steps=(PlanStep(agent=agent, query=req.user_query, symbol=sym),),
+                synthesis_instructions="Return the agent output directly.",
+            )
         return {"plan": plan, "step_index": 0, "step_results": []}
 
     def _run_one_step(req: RouterRequest, step: PlanStep) -> dict:
+        """Dispatch to agent with error handling. Returns fallback dict on failure."""
+        try:
+            return _run_one_step_impl(req, step)
+        except Exception as e:
+            from src.agents.portfolio_agent import PortfolioValidationError
+
+            if isinstance(e, PortfolioValidationError):
+                return {
+                    "summary": str(e),
+                    "answer": f"Portfolio validation error: {e}",
+                    "disclaimer": "Educational information only — not financial, tax, or legal advice.",
+                    "sources": [],
+                }
+            logger.exception("LangGraph step %s failed: %s", step.agent.value, e)
+            return safe_agent_output(step.agent.value, e)
+
+    def _run_one_step_impl(req: RouterRequest, step: PlanStep) -> dict:
         # Dispatch per step
         if step.agent == AgentName.FINANCE_QA:
             from src.agents.finance_qa_agent import run_finance_qa_agent

@@ -297,12 +297,12 @@ def run_news_agent(user_query: str) -> Dict[str, Any]:
         "Summarize and contextualize the news based on the reference material."
     )
 
-    llm = _get_llm()
     try:
+        llm = _get_llm()
         answer = llm.generate(system_prompt=system, user_prompt=prompt, context=context)
     except Exception as e:
         logger.exception("News agent: LLM synthesis failed: %s", e)
-        # Fallback: return a simple list
+        # Fallback: return a simple list of headlines when LLM unavailable
         answer = "\n".join([f"- {it.title} ({it.source})" for it in combined[:10]])
 
     sources: List[Dict[str, Any]] = []

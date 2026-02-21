@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from unittest.mock import patch
+
 import pytest
 
 from src.workflow.router import (
@@ -10,6 +12,15 @@ from src.workflow.router import (
     RouterError,
     RouterRequest,
     RouterResult,
+    _company_alias_to_ticker,
+    _extract_first_json_object,
+    _extract_symbol_from_text,
+    _looks_like_goal_planning_query,
+    _looks_like_market_query,
+    _looks_like_news_query,
+    _looks_like_portfolio_payload,
+    _looks_like_tax_query,
+    _safe_json_loads,
     normalize_request,
     route,
     run,
@@ -22,6 +33,52 @@ try:
 except (ImportError, AttributeError):
     RUN_GRAPH_AVAILABLE = False
     run_graph = None
+
+
+class TestRouterHelpers:
+    """Tests for router helper functions."""
+
+    def test_extract_first_json_object(self) -> None:
+        assert _extract_first_json_object('{"a": 1}') == '{"a": 1}'
+        assert _extract_first_json_object('```json\n{"x": 2}\n```') == '{"x": 2}'
+        assert _extract_first_json_object("text before {\"y\": 3} after") == '{"y": 3}'
+        assert _extract_first_json_object("no json") is None
+
+    def test_safe_json_loads(self) -> None:
+        assert _safe_json_loads('{"a": 1}') == {"a": 1}
+        assert _safe_json_loads("not json") is None
+
+    def test_company_alias_to_ticker(self) -> None:
+        assert _company_alias_to_ticker("Tesla performance") == "TSLA"
+        assert _company_alias_to_ticker("Apple stock") == "AAPL"
+        assert _company_alias_to_ticker("random text") is None
+
+    def test_extract_symbol_from_text(self) -> None:
+        assert _extract_symbol_from_text("AAPL price") == "AAPL"
+        assert _extract_symbol_from_text("rebalancing") is None
+
+    def test_looks_like_market_query(self) -> None:
+        assert _looks_like_market_query("AAPL price today") is True
+        assert _looks_like_market_query("Tesla performance this week") is True
+        assert _looks_like_market_query("What is an ETF?") is False
+
+    def test_looks_like_goal_planning_query(self) -> None:
+        assert _looks_like_goal_planning_query("I want to save for retirement") is True
+        assert _looks_like_goal_planning_query("AAPL price") is False
+
+    def test_looks_like_news_query(self) -> None:
+        assert _looks_like_news_query("Latest news on Tesla") is True
+        assert _looks_like_news_query("AAPL price today") is False
+
+    def test_looks_like_tax_query(self) -> None:
+        assert _looks_like_tax_query("What is capital gains tax?") is True
+        assert _looks_like_tax_query("Roth vs Traditional IRA") is True
+
+    def test_looks_like_portfolio_payload(self) -> None:
+        assert _looks_like_portfolio_payload({"holdings": []}) is True
+        assert _looks_like_portfolio_payload({"holdings": [{"symbol": "AAPL"}]}) is True
+        assert _looks_like_portfolio_payload({}) is False
+        assert _looks_like_portfolio_payload("string") is False
 
 
 class TestRouterNormalize:
@@ -89,6 +146,52 @@ class TestRouterRun:
         assert isinstance(result, RouterResult)
         assert result.agent == AgentName.PORTFOLIO
         assert isinstance(result.output, dict)
+
+    @patch("src.agents.market_analysis_agent.fetch_quote_and_daily")
+    def test_run_market_agent_mocked(self, mock_fetch: object) -> None:
+        from src.agents.market_analysis_agent import Quote, DailyBar
+
+        mock_fetch.return_value = (
+            Quote("AAPL", 150.0, 2.0, 0.013, "2025-01-15"),
+            [DailyBar("2025-01-15", 148, 151, 147, 150, 1_000_000)],
+        )
+        result = run("AAPL price today")
+        assert result.agent == AgentName.MARKET
+        assert "answer" in result.output or "market" in result.output
+
+    @patch("src.agents.tax_education.run_tax_education_agent")
+    def test_run_tax_agent_mocked(self, mock_tax: object) -> None:
+        mock_tax.return_value = {"answer": "Roth vs Traditional...", "sources": []}
+        with patch("src.workflow.router.route") as mock_route:
+            mock_route.return_value = (
+                AgentName.TAX_EDUCATION,
+                RouterRequest(user_query="Roth vs Traditional IRA"),
+            )
+            result = run("Roth vs Traditional IRA")
+            assert result.agent == AgentName.TAX_EDUCATION
+
+    @patch("src.agents.news_agent.run_news_agent")
+    def test_run_news_agent_mocked(self, mock_news: object) -> None:
+        mock_news.return_value = {"answer": "Tesla news...", "sources": []}
+        with patch("src.workflow.router.route") as mock_route:
+            mock_route.return_value = (
+                AgentName.NEWS,
+                RouterRequest(user_query="Tesla news"),
+            )
+            result = run("Tesla news")
+            assert result.agent == AgentName.NEWS
+
+    @patch("src.agents.goal_planning_agent.run_goal_planning_agent")
+    def test_run_goal_agent_mocked(self, mock_goal: object) -> None:
+        mock_goal.return_value = {"answer": "Save $500/month for retirement."}
+        with patch("src.workflow.router.route") as mock_route:
+            mock_route.return_value = (
+                AgentName.GOAL_PLANNING,
+                RouterRequest(user_query="I want to retire"),
+            )
+            result = run("I want to retire in 20 years")
+            assert result.agent == AgentName.GOAL_PLANNING
+
 
 
 class TestMultiAgentRunGraph:
