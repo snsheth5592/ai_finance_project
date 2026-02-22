@@ -4,7 +4,7 @@ import json
 import re
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, Optional, Tuple, Union, TypedDict, List
+from typing import Any, Dict, Optional, Tuple, Union, TypedDict, List, cast
 
 from src.utils.logging import get_logger
 from src.core.llm_client import LLMClient, LLMConfig
@@ -426,6 +426,147 @@ def _looks_like_tax_query(text: str) -> bool:
 
     return tax_hits and not market_exclusions
 
+# --- OUT OF SCOPE HEURISTIC (Finance app guardrail) ---
+def _looks_like_out_of_scope_query(text: str) -> bool:
+    """Return True if query is clearly not finance/investing related.
+
+    This is a finance app; we should not route weather/travel/general chit-chat
+    to market/news agents.
+
+    We only detect the most obvious cases to avoid false positives.
+    """
+    q = (text or "").strip().lower()
+    if not q:
+        return True
+
+    out_hits = any(
+        k in q
+        for k in [
+            "weather",
+            "temperature",
+            "forecast",
+            "rain",
+            "snow",
+            "humidity",
+            "wind",
+            "uv index",
+            "what time is it",
+            "time now",
+            "translate",
+            "lyrics",
+            "recipe",
+            "restaurants",
+            "near me",
+            "directions",
+            "flight",
+            "hotel",
+            "paris",
+            "vacation",
+        ]
+    )
+
+    # If the query contains explicit finance terms, it's in-scope.
+    finance_terms = any(
+        k in q
+        for k in [
+            "stock",
+            "stocks",
+            "bond",
+            "bonds",
+            "etf",
+            "mutual fund",
+            "portfolio",
+            "dividend",
+            "earnings",
+            "market",
+            "ticker",
+            "price",
+            "quote",
+            "invest",
+            "investing",
+            "tax",
+            "ira",
+            "401k",
+            "roth",
+            "hsa",
+            "inflation",
+            "interest rate",
+            "yield",
+        ]
+    )
+
+    return out_hits and not finance_terms
+
+
+# --- HYBRID SCOPE DETECTION: LLM-BASED SCOPE CLASSIFIER ---
+
+class _ScopeResult(TypedDict, total=False):
+    in_scope: bool
+    domain: str
+    confidence: float
+    reason: str
+
+
+def _llm_scope_check(user_query: str) -> Optional[_ScopeResult]:
+    """Use the router LLM to classify whether a query is in-scope for a finance app.
+
+    Called ONLY for ambiguous queries to avoid latency/cost on obvious cases.
+    Returns None if LLM unavailable or output invalid.
+    """
+    q = (user_query or "").strip()
+    if not q:
+        return {"in_scope": False, "domain": "other", "confidence": 1.0, "reason": "Empty query"}
+
+    llm = _get_router_llm()
+    if llm is None:
+        return None
+
+    system = (
+        "You are a strict scope classifier for a finance/investing assistant. "
+        "Decide if the user query is in-scope for finance/investing/taxes/markets/news/goal planning. "
+        "Out-of-scope includes weather, travel, restaurants, recipes, lyrics, translation, general trivia. "
+        "Return ONLY valid JSON with keys: in_scope (boolean), domain (one of finance|tax|market|news|goal_planning|portfolio|other), "
+        "confidence (number 0 to 1), reason (short string)."
+    )
+
+    prompt = f"User query: {q}"
+
+    try:
+        text = llm.generate(system_prompt=system, user_prompt=prompt)
+    except Exception as e:
+        logger.warning("LLM scope check failed: %s", e)
+        return None
+
+    data = _safe_json_loads(str(text).strip())
+    if not isinstance(data, dict):
+        return None
+
+    in_scope = data.get("in_scope")
+    domain = data.get("domain")
+    confidence = data.get("confidence")
+    reason = data.get("reason")
+
+    if not isinstance(in_scope, bool):
+        return None
+    if not isinstance(domain, str):
+        domain = "other"
+    if not isinstance(confidence, (int, float)):
+        confidence = 0.0
+    if not isinstance(reason, str):
+        reason = ""
+
+    domain = domain.strip().lower()
+    if domain not in {"finance", "tax", "market", "news", "goal_planning", "portfolio", "other"}:
+        domain = "other"
+
+    confidence_f = float(confidence)
+    if confidence_f < 0.0:
+        confidence_f = 0.0
+    if confidence_f > 1.0:
+        confidence_f = 1.0
+
+    return cast(_ScopeResult, {"in_scope": in_scope, "domain": domain, "confidence": confidence_f, "reason": reason.strip()})
+
 
 def _llm_plan_text(user_query: str) -> RouterPlan:
     """LLM planner that can select multiple agents.
@@ -435,6 +576,16 @@ def _llm_plan_text(user_query: str) -> RouterPlan:
 
     # Deterministic short-circuit: portfolio payload cannot be inferred from plain text.
     q = (user_query or "").strip()
+
+    # Finance app guardrail: obvious non-finance queries should not be routed to news/market.
+    if _looks_like_out_of_scope_query(q):
+        return RouterPlan(
+            steps=(PlanStep(agent=AgentName.FINANCE_QA, query=q, symbol=None),),
+            synthesis_instructions=(
+                "Politely explain this assistant focuses on finance/investing topics and cannot help with unrelated requests. "
+                "Invite the user to ask a finance-related question instead."
+            ),
+        )
 
     # Deterministic pre-routing for obvious intents (prevents LLM misclassification).
     # Note: we keep chat history out of planning to avoid transcript pollution.
@@ -475,6 +626,18 @@ def _llm_plan_text(user_query: str) -> RouterPlan:
                 "Do not provide personalized financial advice."
             ),
         )
+
+    # Ambiguous scope check (LLM) — only when heuristics didn't confidently match a finance intent.
+    scope = _llm_scope_check(q)
+    if scope and not scope.get("in_scope", True):
+        if float(scope.get("confidence", 0.0)) >= 0.75:
+            return RouterPlan(
+                steps=(PlanStep(agent=AgentName.FINANCE_QA, query=q, symbol=None),),
+                synthesis_instructions=(
+                    "Politely explain this assistant focuses on finance/investing topics and cannot help with unrelated requests. "
+                    "Invite the user to ask a finance-related question instead."
+                ),
+            )
 
     llm = _get_router_llm()
 
@@ -583,6 +746,10 @@ def _llm_plan_text(user_query: str) -> RouterPlan:
 
 def _llm_route_text(user_query: str) -> Tuple[AgentName, Optional[str]]:
     """LLM router for text. Returns (agent, resolved_symbol)."""
+    # Finance app guardrail: avoid routing obvious non-finance queries to other agents.
+    if _looks_like_out_of_scope_query(user_query):
+        return AgentName.FINANCE_QA, None
+
     # Deterministic pre-routing to reduce LLM mistakes.
     if _looks_like_news_query(user_query):
         # Symbol optional; news agent can operate without one.
@@ -596,6 +763,12 @@ def _llm_route_text(user_query: str) -> Tuple[AgentName, Optional[str]]:
 
     if _looks_like_goal_planning_query(user_query):
         return AgentName.GOAL_PLANNING, None
+
+    # Ambiguous scope check (LLM) — only when heuristics didn't match any known finance intent.
+    scope = _llm_scope_check(user_query)
+    if scope and not scope.get("in_scope", True):
+        if float(scope.get("confidence", 0.0)) >= 0.75:
+            return AgentName.FINANCE_QA, None
 
     llm = _get_router_llm()
     if llm is None:
